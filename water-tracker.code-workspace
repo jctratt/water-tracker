@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"python.defaultInterpreterPath": "/usr/bin/python3",
+		"python.analysis.extraPaths": [
+			"/usr/lib/python3/dist-packages"
+		]
+	}
+}
