@@ -1,6 +1,7 @@
-*
-!.gitignore
-!water
-!water-popup.py
-!water-icon.svg
-!water-tray.desktop
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.venv/
