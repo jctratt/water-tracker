@@ -1,0 +1,6 @@
+*
+!.gitignore
+!water
+!water-popup.py
+!water-icon.svg
+!water-tray.desktop

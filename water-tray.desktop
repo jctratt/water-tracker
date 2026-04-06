@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Water Tray
+GenericName=Hydration Tracker
+Comment=Start the PKD water tracker tray app on login
+Exec=sh -c "sleep 5; /home/neon/bin/water tray"
+Icon=/home/neon/bin/water-icon.svg
+Terminal=false
+Categories=Utility;Health;
+StartupNotify=false
+X-KDE-Autostart-Delay=5
+X-GNOME-Autostart-enabled=true
