@@ -250,27 +250,144 @@ def rounded_distribution(values, target_total=None):
     return rounded
 
 
+def round_oz_int(oz):
+    return int(math.floor(oz + 0.5))
+
+
+def current_future_base_targets(now=None):
+    """Return baseline targets for the current and future hours only.
+
+    Past targets stay frozen. The current and future targets come from the plan
+    that was in effect at the start of the current hour.
+    """
+    moment = now or datetime.now()
+    if not within_active_hours(moment):
+        return {}
+
+    hour_start = moment.replace(minute=0, second=0, microsecond=0)
+    drunk_before_hour = total_oz_before_hour(moment.hour, moment)
+    return adjusted_future_expected(hour_start, drunk_before_hour)
+
+
+def adjusted_current_future_targets(now=None):
+    """Return current/future targets adjusted only for current-hour overage.
+
+    Past hour targets remain frozen. If the current hour has already exceeded
+    its target, that overage is removed from future hours proportionally so the
+    future bars still sum to the day's remaining ounces.
+    """
+    moment = now or datetime.now()
+    base_targets = current_future_base_targets(moment)
+    if not base_targets:
+        return {}, {}
+
+    current_target = max(0.0, base_targets.get(moment.hour, 0.0))
+    consumed_this_hour = hourly_oz(moment).get(moment.hour, 0.0)
+    overage = max(0.0, consumed_this_hour - current_target)
+
+    future_base = {hour: value for hour, value in base_targets.items() if hour > moment.hour}
+    future_total = max(0.0, sum(future_base.values()) - overage)
+
+    if future_base and future_total > 0:
+        total_future_base = sum(future_base.values()) or 1.0
+        adjusted_future = {
+            hour: future_total * future_base[hour] / total_future_base
+            for hour in future_base
+        }
+    else:
+        adjusted_future = {}
+
+    adjusted_targets = {moment.hour: current_target, **adjusted_future}
+    target_total = int(round(sum(adjusted_targets.values())))
+    return adjusted_targets, rounded_distribution(adjusted_targets, target_total=target_total)
+
+
+def live_hour_target(now=None):
+    """Current hour target after redistributing carried deficit forward."""
+    moment = now or datetime.now()
+    if not within_active_hours(moment):
+        return 0
+    _, labels = adjusted_current_future_targets(moment)
+    return max(0, labels.get(moment.hour, 0))
+
+
+def committed_expected_oz(now=None):
+    moment = now or datetime.now()
+    if moment.hour < DAY_START_HOUR:
+        return 0
+    if moment.hour >= DAY_END_HOUR:
+        return TARGET_OZ
+
+    committed = commit_missing_hourly_targets(moment)
+    baseline = hourly_expected_weighted()
+    last_hour = min(moment.hour, DAY_END_HOUR - 1)
+    return sum(
+        max(0, round_oz_int(committed.get(hour, baseline.get(hour, 0))))
+        for hour in range(DAY_START_HOUR, last_hour + 1)
+    )
+
+
+def current_hour_remaining_target(now=None):
+    moment = now or datetime.now()
+    if not within_active_hours(moment):
+        return 0
+
+    consumed_this_hour = hourly_oz(moment).get(moment.hour, 0)
+    remaining = live_hour_target(moment) - consumed_this_hour
+    return max(0, round_oz_int(remaining))
+
+
+def current_hour_chunks_remaining(now=None):
+    remaining_target = current_hour_remaining_target(now)
+    if remaining_target <= 0:
+        return 0
+    pkd_max_sip = 8
+    return math.ceil(remaining_target / pkd_max_sip)
+
+
+def current_hour_reminder_interval(now=None):
+    moment = now or datetime.now()
+    if not within_active_hours(moment):
+        return 0
+
+    chunks_remaining = current_hour_chunks_remaining(moment)
+    if chunks_remaining <= 0:
+        return 0
+
+    hour_end = moment.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    remaining_minutes = max(1.0, (hour_end - moment).total_seconds() / 60)
+    return max(20, math.ceil(remaining_minutes / (chunks_remaining + 1)))
+
+
+def fallback_next_reminder_minutes(now=None):
+    moment = now or datetime.now()
+    if not within_active_hours(moment):
+        return 0
+
+    interval = current_hour_reminder_interval(moment)
+    if interval > 0:
+        return interval
+    if moment.hour + 1 >= DAY_END_HOUR:
+        return 0
+
+    next_hour = moment.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    return max(1, math.ceil((next_hour - moment).total_seconds() / 60))
+
+
 def suggested_next_oz(now, drunk, interval_minutes=None):
     """How many oz to aim for in the next reminder interval.
 
-    PKD requires consistent frequent sips, not large boluses.  We cap the
-    suggestion at 8 oz — urgency is expressed via shorter intervals, not bigger
-    drinks.  The snap ladder only goes up to 8 oz for the same reason.
+    Based on the adjusted current hour target after carrying deficit forward.
+    Uses the actual remaining amount for the current adjusted hour target.
     """
     if not within_active_hours(now) or drunk >= TARGET_OZ:
         return 0
+
     remaining_oz = max(0.0, TARGET_OZ - drunk)
-    day_end = now.replace(hour=DAY_END_HOUR, minute=0, second=0, microsecond=0)
-    remaining_minutes = max(1.0, (day_end - now).total_seconds() / 60)
-    if interval_minutes is None:
-        interval_minutes = reminder_interval_minutes(now, drunk=drunk, expected=expected_oz(now))
-    raw = remaining_oz * interval_minutes / remaining_minutes
-    PKD_MAX_SIP = 8
-    # Snap to meaningful sip sizes, never exceeding the PKD max
-    for snap in (4, 6, 8):
-        if raw <= snap:
-            return snap
-    return PKD_MAX_SIP
+    hour_remaining = current_hour_remaining_target(now)
+    if hour_remaining <= 0:
+        return 0
+    return max(1, min(hour_remaining, int(math.ceil(remaining_oz))))
 
 
 def reminder_interval_minutes(now=None, drunk=None, expected=None):
@@ -325,7 +442,7 @@ def pace_summary(drunk, expected):
 def build_status_lines(now=None, next_reminder_at=None):
     moment = now or datetime.now()
     drunk = total_oz(moment)
-    expected = expected_oz(moment)
+    expected = committed_expected_oz(moment)
     remaining = max(0, TARGET_OZ - drunk)
     _, pace_text = pace_summary(drunk, expected)
     lines = [
@@ -338,12 +455,27 @@ def build_status_lines(now=None, next_reminder_at=None):
             minutes = max(1, math.ceil((next_reminder_at - moment).total_seconds() / 60))
             lines.append(f"Next reminder in ~{minutes} min")
         else:
-            lines.append(f"Next reminder in ~{reminder_interval_minutes(moment, drunk=drunk, expected=expected)} min")
+            minutes = fallback_next_reminder_minutes(moment)
+            if minutes > 0:
+                lines.append(f"Next reminder in ~{minutes} min")
     elif drunk >= TARGET_OZ:
         lines.append("Reminders paused: daily goal reached")
     else:
         lines.append("Reminders pause outside 7 AM - 9 PM")
     return lines
+
+
+def next_reminder_label_text(now, drunk, next_reminder_at=None):
+    if next_reminder_at and next_reminder_at > now:
+        next_minutes = max(1, math.ceil((next_reminder_at - now).total_seconds() / 60))
+    else:
+        next_minutes = fallback_next_reminder_minutes(now)
+
+    sip = suggested_next_oz(now, drunk, interval_minutes=next_minutes)
+    if sip > 0:
+        return f"   Next reminder: ~{next_minutes} min  →  aim for {sip} oz", sip
+
+    return f"   Next reminder: ~{next_minutes} min  →  current hour target met", 0
 
 
 def read_pid():
@@ -517,28 +649,16 @@ if HAS_QT:
 
             hist_exp = hourly_expected_weighted()
             committed = load_committed_targets(self.snapshot)
-            remaining_oz = max(0.0, TARGET_OZ - drunk)
 
-            # Past + current hour: show the committed target for reference.
-            past_cur_exp = {
+            past_exp = {
                 h: committed.get(h, hist_exp.get(h, 0))
-                for h in range(DAY_START_HOUR, current_hour + 1)
+                for h in range(DAY_START_HOUR, min(current_hour, DAY_END_HOUR))
             }
-            # Fully future hours only: redistribute ALL remaining oz with bell
-            # weighting, starting from current_hour+1. This guarantees future
-            # bars sum to remaining_oz, matching the "X oz remaining" counter.
-            future_hs = list(range(current_hour + 1, DAY_END_HOUR))
-            if future_hs:
-                fw = {hh: bell_weight(hh + 0.5) for hh in future_hs}
-                fw_total = sum(fw.values()) or 1.0
-                future_exp = {hh: remaining_oz * fw[hh] / fw_total for hh in future_hs}
-            else:
-                future_exp = {}
+            current_future_exp, current_future_labels = adjusted_current_future_targets(self.snapshot)
 
-            combined_exp = {**past_cur_exp, **future_exp}
-            past_labels = rounded_distribution(past_cur_exp)
-            future_labels = rounded_distribution(future_exp, target_total=int(round(remaining_oz)))
-            expected_labels = {**past_labels, **future_labels}
+            combined_exp = {**past_exp, **current_future_exp}
+            past_labels = rounded_distribution(past_exp, target_total=int(round(sum(past_exp.values()))))
+            expected_labels = {**past_labels, **current_future_labels}
 
             all_exp = list(combined_exp.values())
             max_exp = max(all_exp) if all_exp else 8.0
@@ -700,7 +820,7 @@ if HAS_QT:
             if within_active_hours(snapshot_time):
                 commit_missing_hourly_targets(snapshot_time)
             drunk = total_oz(snapshot_time)
-            expected = expected_oz(snapshot_time)
+            expected = committed_expected_oz(snapshot_time)
             remaining = max(0, TARGET_OZ - drunk)
 
             root = QVBoxLayout(self)
@@ -756,12 +876,12 @@ if HAS_QT:
                 root.addWidget(evening_label)
 
             if within_active_hours(snapshot_time) and drunk < TARGET_OZ:
-                if self.next_reminder_at and self.next_reminder_at > snapshot_time:
-                    next_minutes = max(1, math.ceil((self.next_reminder_at - snapshot_time).total_seconds() / 60))
-                else:
-                    next_minutes = reminder_interval_minutes(snapshot_time, drunk=drunk, expected=expected)
-                sip = suggested_next_oz(snapshot_time, drunk, interval_minutes=next_minutes)
-                next_label = QLabel(f"   Next reminder: ~{next_minutes} min  →  aim for {sip} oz")
+                next_text, sip = next_reminder_label_text(
+                    snapshot_time,
+                    drunk,
+                    next_reminder_at=self.next_reminder_at,
+                )
+                next_label = QLabel(next_text)
             elif drunk >= TARGET_OZ:
                 next_label = QLabel("   Reminders paused: goal reached")
                 sip = 0
@@ -878,7 +998,7 @@ if HAS_QT:
             if within_active_hours(now):
                 commit_missing_hourly_targets(now)
             drunk = total_oz(now)
-            expected = expected_oz(now)
+            expected = committed_expected_oz(now)
             remaining = max(0, TARGET_OZ - drunk)
             percent = min(100, int(drunk * 100 / TARGET_OZ))
 
@@ -908,12 +1028,12 @@ if HAS_QT:
             self.remaining_label.setText(f"   {format_oz(remaining)} oz remaining to goal")
 
             if within_active_hours(now) and drunk < TARGET_OZ:
-                if self.next_reminder_at and self.next_reminder_at > now:
-                    next_minutes = max(1, math.ceil((self.next_reminder_at - now).total_seconds() / 60))
-                else:
-                    next_minutes = reminder_interval_minutes(now, drunk=drunk, expected=expected)
-                sip = suggested_next_oz(now, drunk, interval_minutes=next_minutes)
-                self.next_label.setText(f"   Next reminder: ~{next_minutes} min  →  aim for {sip} oz")
+                next_text, sip = next_reminder_label_text(
+                    now,
+                    drunk,
+                    next_reminder_at=self.next_reminder_at,
+                )
+                self.next_label.setText(next_text)
             elif drunk >= TARGET_OZ:
                 self.next_label.setText("   Reminders paused: goal reached")
                 sip = 0
@@ -991,6 +1111,7 @@ if HAS_QT:
             self.popups = []
             self.next_reminder_at = None
             self.current_day = today_string()
+            self.current_hour = datetime.now().hour
             self._build_menu()
             if within_active_hours(datetime.now()):
                 commit_missing_hourly_targets()
@@ -1072,8 +1193,8 @@ if HAS_QT:
             if drunk >= TARGET_OZ or not within_active_hours(now):
                 return None
             if not self.next_reminder_at:
-                expected = expected_oz(now)
-                return reminder_interval_minutes(now, drunk=drunk, expected=expected)
+                minutes = fallback_next_reminder_minutes(now)
+                return minutes or None
             remaining_seconds = max(0, int((self.next_reminder_at - now).total_seconds()))
             return max(1, math.ceil(remaining_seconds / 60))
 
@@ -1117,7 +1238,7 @@ if HAS_QT:
             if within_active_hours(now):
                 commit_missing_hourly_targets(now)
             drunk = total_oz(now)
-            expected = expected_oz(now)
+            expected = committed_expected_oz(now)
             _, pace_text = pace_summary(drunk, expected)
 
             self.status_action.setText(f"Today: {format_oz(drunk)} / {TARGET_OZ} oz")
@@ -1138,8 +1259,23 @@ if HAS_QT:
             if drunk >= TARGET_OZ or not within_active_hours(moment):
                 self.next_reminder_at = None
                 return
-            expected = expected_oz(moment)
-            interval = reminder_interval_minutes(moment, drunk=drunk, expected=expected)
+
+            hour_interval = current_hour_reminder_interval(moment)
+            if hour_interval > 0:
+                interval = hour_interval
+            elif moment.hour + 1 < DAY_END_HOUR:
+                next_hour = moment.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+                self.next_reminder_at = next_hour
+                logging.info(
+                    "Scheduled next reminder for next hour boundary at %s",
+                    next_hour.strftime("%H:%M:%S"),
+                )
+                return
+            else:
+                self.next_reminder_at = None
+                logging.info("No more reminders scheduled for today")
+                return
+
             last_time = last_entry_time(moment)
             if last_time is not None:
                 candidate = last_time + timedelta(minutes=interval)
@@ -1147,10 +1283,11 @@ if HAS_QT:
             else:
                 self.next_reminder_at = moment + timedelta(minutes=interval)
             logging.info(
-                "Scheduled next reminder in %s minutes (drunk=%s expected=%s last=%s)",
+                "Scheduled next reminder in %s minutes (drunk=%s hour_target=%s hour_remaining=%s last=%s)",
                 interval,
                 format_oz(drunk),
-                expected,
+                live_hour_target(moment),
+                current_hour_remaining_target(moment),
                 last_time.strftime("%H:%M:%S") if last_time else "none",
             )
 
@@ -1160,8 +1297,8 @@ if HAS_QT:
             if not within_active_hours(now):
                 return "Reminders pause outside 7 AM - 9 PM"
             if not self.next_reminder_at:
-                expected = expected_oz(now)
-                return f"Next reminder: ~{reminder_interval_minutes(now, drunk=drunk, expected=expected)} min"
+                minutes = fallback_next_reminder_minutes(now)
+                return f"Next reminder: ~{minutes} min"
 
             remaining_minutes = self._countdown_minutes(now, drunk)
             return f"Next reminder in ~{remaining_minutes} min"
@@ -1171,6 +1308,12 @@ if HAS_QT:
             today = today_string(now)
             if today != self.current_day:
                 self.current_day = today
+                self.current_hour = now.hour
+                self.refresh_state(reschedule=True)
+                return
+
+            if now.hour != self.current_hour:
+                self.current_hour = now.hour
                 self.refresh_state(reschedule=True)
                 return
 
@@ -1338,7 +1481,7 @@ def run_kdialog():
     drunk = total_oz()
     remaining = max(0, TARGET_OZ - drunk)
     percent = min(100, int(drunk * 100 / TARGET_OZ))
-    expected = expected_oz()
+    expected = committed_expected_oz()
     _, pace_text = pace_summary(drunk, expected)
 
     message = (

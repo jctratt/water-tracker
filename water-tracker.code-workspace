@@ -8,6 +8,9 @@
 		"python.defaultInterpreterPath": "/usr/bin/python3",
 		"python.analysis.extraPaths": [
 			"/usr/lib/python3/dist-packages"
-		]
+		],
+		"chat.tools.terminal.autoApprove": {
+			"/home/neon/bin/water": true
+		}
 	}
 }

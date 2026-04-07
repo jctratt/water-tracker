@@ -46,6 +46,18 @@ tray_pid() {
   return 1
 }
 
+wait_for_tray_start() {
+  local attempt pid
+  for attempt in {1..20}; do
+    if pid=$(tray_pid); then
+      echo "$pid"
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
 total_oz() {
   [[ -f "$LOG_FILE" ]] || { echo 0; return; }
   awk '{sum += $2} END {print sum+0}' "$LOG_FILE"
@@ -138,8 +150,13 @@ cmd_tray_start() {
   fi
 
   nohup python3 "$POPUP_SCRIPT" tray >> "${DATA_DIR}/tray.log" 2>&1 &
-  echo -e "${GRN}Tray started. Look for the Water icon in the KDE system tray.${RST}"
-  echo -e "${CYN}Log: ${DATA_DIR}/tray.log${RST}"
+  if pid=$(wait_for_tray_start); then
+    echo -e "${GRN}Tray started (pid ${pid}). Look for the Water icon in the KDE system tray.${RST}"
+    echo -e "${CYN}Log: ${DATA_DIR}/tray.log${RST}"
+  else
+    echo -e "${RED}Tray failed to start. Check ${DATA_DIR}/tray.log${RST}" >&2
+    exit 1
+  fi
 }
 
 cmd_tray_stop() {
@@ -162,7 +179,12 @@ cmd_tray_restart() {
     done
   fi
   nohup python3 "$POPUP_SCRIPT" tray >> "${DATA_DIR}/tray.log" 2>&1 &
-  echo -e "${GRN}Tray restarted.${RST}"
+  if pid=$(wait_for_tray_start); then
+    echo -e "${GRN}Tray restarted (pid ${pid}).${RST}"
+  else
+    echo -e "${RED}Tray failed to restart. Check ${DATA_DIR}/tray.log${RST}" >&2
+    exit 1
+  fi
 }
 
 cmd_tray_status() {
