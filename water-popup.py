@@ -9,6 +9,7 @@ Modes:
 """
 
 import atexit
+import json
 import logging
 import math
 import os
@@ -25,8 +26,11 @@ DATA_DIR = Path.home() / ".local" / "share" / "water"
 PID_FILE = DATA_DIR / "tray.pid"
 TRAY_LOG_FILE = DATA_DIR / "tray.log"
 ICON_FILE = Path.home() / "bin" / "water-icon.svg"
-QUICK_ADD = [4, 8, 12, 16, 20, 24]
+QUICK_ADD = [1, 2, 3, 4, 8, 12, 16, 20, 24]
 LABELS = [
+    "1 oz\nsip",
+    "2 oz\nsip",
+    "3 oz\nsip",
     "4 oz\nsip",
     "8 oz\n1/2 cup",
     "12 oz\nmug",
@@ -68,6 +72,25 @@ def read_entries(now=None):
     return entries
 
 
+def last_entry_time(now=None):
+    entries = read_entries(now)
+    if not entries:
+        return None
+
+    timestamp = entries[-1][0]
+    try:
+        last_time = datetime.strptime(timestamp, "%H:%M:%S")
+    except ValueError:
+        return None
+    moment = now or datetime.now()
+    return moment.replace(
+        hour=last_time.hour,
+        minute=last_time.minute,
+        second=last_time.second,
+        microsecond=0,
+    )
+
+
 def total_oz(now=None):
     return sum(amount for _, amount in read_entries(now))
 
@@ -84,9 +107,23 @@ def hourly_oz(now=None):
     return by_hour
 
 
+def total_oz_before_hour(hour, now=None):
+    total = 0.0
+    for time_str, oz in read_entries(now):
+        try:
+            entry_hour = int(time_str.split(":")[0])
+        except (ValueError, IndexError):
+            continue
+        if entry_hour < hour:
+            total += oz
+    return total
+
+
 def log_oz(oz, now=None):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     moment = now or datetime.now()
+    if within_active_hours(moment):
+        commit_missing_hourly_targets(moment)
     with current_log_file(moment).open("a", encoding="utf-8") as handle:
         handle.write(f"{moment.strftime('%H:%M:%S')} {format_oz(oz)}\n")
 
@@ -125,25 +162,115 @@ def adjusted_future_expected(now, drunk):
     future_hours = [h for h in range(max(current_hour, DAY_START_HOUR), DAY_END_HOUR)]
     if not future_hours:
         return {}
-    weights = {h: bell_weight(h + 0.5) for h in future_hours}
+
+    remaining_hour_fraction = max(
+        0.0,
+        1.0 - ((now.minute * 60 + now.second) / 3600),
+    )
+
+    weights = {}
+    for hour in future_hours:
+        hour_weight = bell_weight(hour + 0.5)
+        if hour == current_hour:
+            hour_weight *= remaining_hour_fraction
+        weights[hour] = hour_weight
+
     total_w = sum(weights.values()) or 1.0
     return {h: remaining_oz * w / total_w for h, w in weights.items()}
 
 
-def suggested_next_oz(now, drunk):
-    """How many oz to aim for in the next reminder interval."""
+def _committed_targets_path(now=None):
+    return DATA_DIR / f"{today_string(now)}.targets.json"
+
+
+def load_committed_targets(now=None):
+    """Return {hour: oz} that were saved when each hour started."""
+    path = _committed_targets_path(now)
+    if not path.exists():
+        return {}
+    try:
+        return {int(k): float(v) for k, v in json.loads(path.read_text()).items()}
+    except (OSError, ValueError, KeyError):
+        return {}
+
+
+def commit_hourly_targets(now=None, drunk=None):
+    """Backward-compatible wrapper for committing hour targets."""
+    return commit_missing_hourly_targets(now)
+
+
+def commit_missing_hourly_targets(now=None):
+    """Persist hour-start targets for any missing hours up to the current hour."""
+    moment = now or datetime.now()
+    if moment.hour < DAY_START_HOUR:
+        return load_committed_targets(moment)
+
+    committed = load_committed_targets(moment)
+    last_hour = min(moment.hour, DAY_END_HOUR - 1)
+    changed = False
+
+    for hour in range(DAY_START_HOUR, last_hour + 1):
+        if hour in committed:
+            continue
+        hour_start = moment.replace(hour=hour, minute=0, second=0, microsecond=0)
+        drunk_before_hour = total_oz_before_hour(hour, moment)
+        adj = adjusted_future_expected(hour_start, drunk_before_hour)
+        committed[hour] = round(adj.get(hour, 0.0), 2)
+        changed = True
+
+    if changed:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        _committed_targets_path(moment).write_text(
+            json.dumps({str(k): v for k, v in sorted(committed.items())})
+        )
+
+    return committed
+
+
+def rounded_distribution(values, target_total=None):
+    """Round values to integers while preserving the rounded total."""
+    if not values:
+        return {}
+
+    if target_total is None:
+        target_total = int(round(sum(values.values())))
+
+    rounded = {key: int(math.floor(value)) for key, value in values.items()}
+    remainder = max(0, target_total - sum(rounded.values()))
+
+    ranked_keys = sorted(
+        values,
+        key=lambda key: (values[key] - math.floor(values[key]), -key),
+        reverse=True,
+    )
+
+    for key in ranked_keys[:remainder]:
+        rounded[key] += 1
+
+    return rounded
+
+
+def suggested_next_oz(now, drunk, interval_minutes=None):
+    """How many oz to aim for in the next reminder interval.
+
+    PKD requires consistent frequent sips, not large boluses.  We cap the
+    suggestion at 8 oz — urgency is expressed via shorter intervals, not bigger
+    drinks.  The snap ladder only goes up to 8 oz for the same reason.
+    """
     if not within_active_hours(now) or drunk >= TARGET_OZ:
         return 0
     remaining_oz = max(0.0, TARGET_OZ - drunk)
     day_end = now.replace(hour=DAY_END_HOUR, minute=0, second=0, microsecond=0)
     remaining_minutes = max(1.0, (day_end - now).total_seconds() / 60)
-    interval = reminder_interval_minutes(now, drunk=drunk, expected=expected_oz(now))
-    raw = remaining_oz * interval / remaining_minutes
-    # Snap to meaningful sip sizes
-    for cap, snap in [(5, 4), (9, 8), (13, 12), (18, 16), (23, 20)]:
-        if raw <= cap:
+    if interval_minutes is None:
+        interval_minutes = reminder_interval_minutes(now, drunk=drunk, expected=expected_oz(now))
+    raw = remaining_oz * interval_minutes / remaining_minutes
+    PKD_MAX_SIP = 8
+    # Snap to meaningful sip sizes, never exceeding the PKD max
+    for snap in (4, 6, 8):
+        if raw <= snap:
             return snap
-    return 24
+    return PKD_MAX_SIP
 
 
 def reminder_interval_minutes(now=None, drunk=None, expected=None):
@@ -195,7 +322,7 @@ def pace_summary(drunk, expected):
     return "pace_bad", f"Behind pace by {abs(pace_diff)} oz - drink now"
 
 
-def build_status_lines(now=None):
+def build_status_lines(now=None, next_reminder_at=None):
     moment = now or datetime.now()
     drunk = total_oz(moment)
     expected = expected_oz(moment)
@@ -207,7 +334,11 @@ def build_status_lines(now=None):
         f"Remaining: {format_oz(remaining)} oz",
     ]
     if within_active_hours(moment) and drunk < TARGET_OZ:
-        lines.append(f"Next reminder in ~{reminder_interval_minutes(moment, drunk=drunk, expected=expected)} min")
+        if next_reminder_at and next_reminder_at > moment:
+            minutes = max(1, math.ceil((next_reminder_at - moment).total_seconds() / 60))
+            lines.append(f"Next reminder in ~{minutes} min")
+        else:
+            lines.append(f"Next reminder in ~{reminder_interval_minutes(moment, drunk=drunk, expected=expected)} min")
     elif drunk >= TARGET_OZ:
         lines.append("Reminders paused: daily goal reached")
     else:
@@ -275,6 +406,7 @@ try:
         QMessageBox,
         QProgressBar,
         QPushButton,
+        QLineEdit,
         QStyle,
         QSystemTrayIcon,
         QVBoxLayout,
@@ -384,14 +516,38 @@ if HAS_QT:
             drunk = sum(self.hourly.values())
 
             hist_exp = hourly_expected_weighted()
-            fwd_exp = adjusted_future_expected(self.snapshot, drunk)
+            committed = load_committed_targets(self.snapshot)
+            remaining_oz = max(0.0, TARGET_OZ - drunk)
 
-            all_exp = list(hist_exp.values()) + list(fwd_exp.values())
+            # Past + current hour: show the committed target for reference.
+            past_cur_exp = {
+                h: committed.get(h, hist_exp.get(h, 0))
+                for h in range(DAY_START_HOUR, current_hour + 1)
+            }
+            # Fully future hours only: redistribute ALL remaining oz with bell
+            # weighting, starting from current_hour+1. This guarantees future
+            # bars sum to remaining_oz, matching the "X oz remaining" counter.
+            future_hs = list(range(current_hour + 1, DAY_END_HOUR))
+            if future_hs:
+                fw = {hh: bell_weight(hh + 0.5) for hh in future_hs}
+                fw_total = sum(fw.values()) or 1.0
+                future_exp = {hh: remaining_oz * fw[hh] / fw_total for hh in future_hs}
+            else:
+                future_exp = {}
+
+            combined_exp = {**past_cur_exp, **future_exp}
+            past_labels = rounded_distribution(past_cur_exp)
+            future_labels = rounded_distribution(future_exp, target_total=int(round(remaining_oz)))
+            expected_labels = {**past_labels, **future_labels}
+
+            all_exp = list(combined_exp.values())
             max_exp = max(all_exp) if all_exp else 8.0
-            max_oz = max_exp * 2.2
+            max_actual = max(self.hourly.values()) if self.hourly else 0.0
+            max_oz = max(max_exp, max_actual or 8.0) * 2.2
 
             slot_w = chart_w / len(hours)
             bar_w = max(3, slot_w * 0.78)
+            half_w = max(2, int(bar_w * 0.45))
 
             # Background + baseline
             painter.fillRect(0, 0, w, h, QColor("#0d1117"))
@@ -399,34 +555,67 @@ if HAS_QT:
             painter.setPen(QPen(QColor("#30363d"), 1))
             painter.drawLine(left_m, base_y, w - right_m, base_y)
 
+            # Hour-boundary tick marks on the x-axis.
+            tick_pen = QPen(QColor("#4b5563"), 1)
+            painter.setPen(tick_pen)
+            tick_top = base_y - 4
+            tick_bottom = base_y + 4
+            for i in range(1, len(hours)):
+                tick_x = int(left_m + i * slot_w)
+                painter.drawLine(tick_x, tick_top, tick_x, tick_bottom)
+
             label_font = QFont("Hack")
             label_font.setPixelSize(9)
 
-            # --- Expected bars + deficit markers ---
+            # --- Expected bars and consumed totals ---
             for i, hour in enumerate(hours):
                 slot_x = left_m + i * slot_w
                 bar_x = slot_x + (slot_w - bar_w) / 2
                 is_future = hour > current_hour
                 is_current = hour == current_hour
 
-                if is_future or is_current:
-                    exp_oz = fwd_exp.get(hour, 0)
-                    exp_color = QColor("#0d2640") if is_future else QColor("#1a4060")
+                exp_oz = combined_exp.get(hour, 0)
+                if is_future:
+                    exp_color = QColor("#0d2640")
+                elif is_current:
+                    exp_color = QColor("#1a4060")
                 else:
-                    exp_oz = hist_exp.get(hour, 0)
                     exp_color = QColor("#1a3a5c")
 
-                if exp_oz > 0:
-                    exp_px = max(2, int(chart_h * min(exp_oz, max_oz) / max_oz))
-                    painter.fillRect(int(bar_x), base_y - exp_px, int(bar_w), exp_px, exp_color)
+                actual_h = self.hourly.get(hour, 0)
+                exp_px = max(2, int(chart_h * min(exp_oz, max_oz) / max_oz)) if exp_oz > 0 else 0
+                act_px = max(2, int(chart_h * min(actual_h, max_oz) / max_oz)) if actual_h > 0 else 0
 
-                # Deficit: past hours where consumed < expected
-                if not is_future and not is_current and exp_oz > 0:
-                    actual_h = self.hourly.get(hour, 0)
-                    act_px = max(0, int(chart_h * min(actual_h, max_oz) / max_oz))
-                    exp_px = max(2, int(chart_h * min(exp_oz, max_oz) / max_oz))
-                    if exp_px > act_px:
-                        painter.fillRect(int(bar_x), base_y - exp_px, int(bar_w), exp_px - act_px, QColor("#5a1e1e"))
+                if exp_px > 0:
+                    painter.fillRect(int(bar_x), base_y - exp_px, half_w, exp_px, exp_color)
+                if act_px > 0:
+                    painter.fillRect(int(bar_x + half_w + 1), base_y - act_px, half_w, act_px, QColor("#56d364"))
+
+                if exp_px > 0:
+                    label_value = str(expected_labels.get(hour, round(exp_oz)))
+                    legend_font = QFont("Hack")
+                    legend_font.setPixelSize(8)
+                    painter.setFont(legend_font)
+                    painter.setPen(QColor("#8b949e"))
+                    fm2 = painter.fontMetrics()
+                    label_x = int(bar_x + (half_w - fm2.horizontalAdvance(label_value)) / 2)
+                    label_y = base_y - exp_px - 6
+                    if label_y < top_m + fm2.height():
+                        label_y = top_m + fm2.height()
+                    painter.drawText(label_x, label_y, label_value)
+
+                if act_px > 0:
+                    actual_label = str(round(actual_h))
+                    legend_font = QFont("Hack")
+                    legend_font.setPixelSize(8)
+                    painter.setFont(legend_font)
+                    painter.setPen(QColor("#56d364"))
+                    fm3 = painter.fontMetrics()
+                    actual_x = int(bar_x + half_w + 1 + (half_w - fm3.horizontalAdvance(actual_label)) / 2)
+                    actual_y = base_y - act_px - 6
+                    if actual_y < top_m + fm3.height():
+                        actual_y = top_m + fm3.height()
+                    painter.drawText(actual_x, actual_y, actual_label)
 
                 # Current hour marker
                 if is_current:
@@ -443,13 +632,6 @@ if HAS_QT:
                     lbl = f"{hour % 12 or 12}{suffix}"
                     lx = int(slot_x + slot_w / 2 - fm.horizontalAdvance(lbl) / 2)
                     painter.drawText(lx, h - 6, lbl)
-
-            # 9p at right edge
-            painter.setFont(label_font)
-            painter.setPen(QColor("#6e7681"))
-            fm = painter.fontMetrics()
-            end_lbl = "9p"
-            painter.drawText(w - right_m - fm.horizontalAdvance(end_lbl), h - 6, end_lbl)
 
             # --- Individual drink line + dots ---
             entries = read_entries(self.snapshot)
@@ -497,11 +679,12 @@ if HAS_QT:
             painter.end()
 
     class WaterPopup(QWidget):
-        def __init__(self, remind_mode=False, on_log=None, on_snooze=None):
+        def __init__(self, remind_mode=False, on_log=None, on_snooze=None, next_reminder_at=None):
             super().__init__()
             self.remind_mode = remind_mode
             self.on_log = on_log
             self.on_snooze = on_snooze
+            self.next_reminder_at = next_reminder_at
             self._build_ui()
             self._position_window()
 
@@ -514,6 +697,8 @@ if HAS_QT:
             self.setFixedWidth(420)
 
             snapshot_time = datetime.now()
+            if within_active_hours(snapshot_time):
+                commit_missing_hourly_targets(snapshot_time)
             drunk = total_oz(snapshot_time)
             expected = expected_oz(snapshot_time)
             remaining = max(0, TARGET_OZ - drunk)
@@ -545,20 +730,24 @@ if HAS_QT:
             else:
                 chunk_color = "#f85149"
             bar.setStyleSheet(bar.styleSheet() + f"QProgressBar::chunk {{ background: {chunk_color}; }}")
+            self.bar = bar
             root.addWidget(bar)
 
             chart_label = QLabel("Hourly: expected vs consumed")
             chart_label.setObjectName("status")
             root.addWidget(chart_label)
-            root.addWidget(DailyBarChart(now=snapshot_time))
+            self.chart = DailyBarChart(now=snapshot_time)
+            root.addWidget(self.chart)
 
             pace_class, pace_text = pace_summary(drunk, expected)
             pace_label = QLabel(pace_text)
             pace_label.setObjectName(pace_class)
+            self.pace_label = pace_label
             root.addWidget(pace_label)
 
             remaining_label = QLabel(f"   {format_oz(remaining)} oz remaining to goal")
             remaining_label.setObjectName("status")
+            self.remaining_label = remaining_label
             root.addWidget(remaining_label)
 
             if snapshot_time.hour >= 20:
@@ -567,8 +756,11 @@ if HAS_QT:
                 root.addWidget(evening_label)
 
             if within_active_hours(snapshot_time) and drunk < TARGET_OZ:
-                next_minutes = reminder_interval_minutes(snapshot_time, drunk=drunk, expected=expected)
-                sip = suggested_next_oz(snapshot_time, drunk)
+                if self.next_reminder_at and self.next_reminder_at > snapshot_time:
+                    next_minutes = max(1, math.ceil((self.next_reminder_at - snapshot_time).total_seconds() / 60))
+                else:
+                    next_minutes = reminder_interval_minutes(snapshot_time, drunk=drunk, expected=expected)
+                sip = suggested_next_oz(snapshot_time, drunk, interval_minutes=next_minutes)
                 next_label = QLabel(f"   Next reminder: ~{next_minutes} min  →  aim for {sip} oz")
             elif drunk >= TARGET_OZ:
                 next_label = QLabel("   Reminders paused: goal reached")
@@ -577,8 +769,10 @@ if HAS_QT:
                 next_label = QLabel("   Reminders pause outside 7 AM - 9 PM")
                 sip = 0
             next_label.setObjectName("status")
+            self.next_label = next_label
             root.addWidget(next_label)
 
+            self.quick_buttons = []
             divider = QFrame()
             divider.setObjectName("divider")
             divider.setFrameShape(QFrame.HLine)
@@ -592,10 +786,14 @@ if HAS_QT:
             row_one.setSpacing(6)
             row_two = QHBoxLayout()
             row_two.setSpacing(6)
+            row_three = QHBoxLayout()
+            row_three.setSpacing(6)
 
             for index, (oz, label) in enumerate(zip(QUICK_ADD, LABELS)):
                 button = QPushButton(label)
                 button.setObjectName("add_btn")
+                button.amount = oz
+                self.quick_buttons.append(button)
                 if oz == sip:
                     button.setStyleSheet(
                         "QPushButton#add_btn {"
@@ -610,16 +808,43 @@ if HAS_QT:
                 button.clicked.connect(lambda checked=False, amount=oz: self._log_and_close(amount))
                 if index < 3:
                     row_one.addWidget(button)
-                else:
+                elif index < 6:
                     row_two.addWidget(button)
+                else:
+                    row_three.addWidget(button)
 
             root.addLayout(row_one)
             root.addLayout(row_two)
+            root.addLayout(row_three)
 
             divider_two = QFrame()
             divider_two.setObjectName("divider")
             divider_two.setFrameShape(QFrame.HLine)
             root.addWidget(divider_two)
+
+            manual_label = QLabel("Custom amount:")
+            manual_label.setObjectName("status")
+            root.addWidget(manual_label)
+
+            manual_row = QHBoxLayout()
+            manual_row.setSpacing(6)
+            self.manual_input = QLineEdit()
+            self.manual_input.setPlaceholderText("Enter oz")
+            self.manual_input.setFixedWidth(86)
+            self.manual_input.setStyleSheet(
+                "QLineEdit {"
+                "  background: #0d1117; color: #c9d1d9; border: 1px solid #30363d;"
+                "  border-radius: 8px; padding: 8px; font-family: 'JetBrains Mono','Noto Mono',monospace;"
+                "}"
+            )
+            self.manual_input.setAlignment(Qt.AlignCenter)
+            self.manual_input.returnPressed.connect(self._add_manual_amount)
+            manual_button = QPushButton("Add")
+            manual_button.setObjectName("add_btn")
+            manual_button.clicked.connect(self._add_manual_amount)
+            manual_row.addWidget(self.manual_input)
+            manual_row.addWidget(manual_button)
+            root.addLayout(manual_row)
 
             if self.remind_mode:
                 snooze_label = QLabel("Snooze reminder:")
@@ -644,6 +869,79 @@ if HAS_QT:
 
             self.adjustSize()
 
+        def showEvent(self, event):
+            super().showEvent(event)
+            self._refresh_dynamic_display()
+
+        def _refresh_dynamic_display(self):
+            now = datetime.now()
+            if within_active_hours(now):
+                commit_missing_hourly_targets(now)
+            drunk = total_oz(now)
+            expected = expected_oz(now)
+            remaining = max(0, TARGET_OZ - drunk)
+            percent = min(100, int(drunk * 100 / TARGET_OZ))
+
+            self.bar.setValue(percent)
+            self.bar.setFormat(f"{format_oz(drunk)} / {TARGET_OZ} oz  ({percent}%)")
+            if percent >= 75:
+                chunk_color = "#3fb950"
+            elif percent >= 40:
+                chunk_color = "#d29922"
+            else:
+                chunk_color = "#f85149"
+            self.bar.setStyleSheet(
+                "QProgressBar {"
+                "  border: 1px solid #30363d; border-radius: 6px; background: #161b22;"
+                "  height: 14px; text-align: center; color: #c9d1d9; font-size: 10px; font-family: monospace;"
+                "}"
+                f"QProgressBar::chunk {{ background: {chunk_color}; border-radius: 5px; }}"
+            )
+
+            pace_class, pace_text = pace_summary(drunk, expected)
+            self.pace_label.setText(pace_text)
+            self.pace_label.setObjectName(pace_class)
+            self.pace_label.style().unpolish(self.pace_label)
+            self.pace_label.style().polish(self.pace_label)
+            self.pace_label.update()
+
+            self.remaining_label.setText(f"   {format_oz(remaining)} oz remaining to goal")
+
+            if within_active_hours(now) and drunk < TARGET_OZ:
+                if self.next_reminder_at and self.next_reminder_at > now:
+                    next_minutes = max(1, math.ceil((self.next_reminder_at - now).total_seconds() / 60))
+                else:
+                    next_minutes = reminder_interval_minutes(now, drunk=drunk, expected=expected)
+                sip = suggested_next_oz(now, drunk, interval_minutes=next_minutes)
+                self.next_label.setText(f"   Next reminder: ~{next_minutes} min  →  aim for {sip} oz")
+            elif drunk >= TARGET_OZ:
+                self.next_label.setText("   Reminders paused: goal reached")
+                sip = 0
+            else:
+                self.next_label.setText("   Reminders pause outside 7 AM - 9 PM")
+                sip = 0
+
+            self._update_button_highlight(sip)
+            self.chart.snapshot = now
+            self.chart.hourly = hourly_oz(now)
+            self.chart.update()
+
+        def _update_button_highlight(self, sip):
+            for button in self.quick_buttons:
+                if button.amount == sip and sip > 0:
+                    button.setStyleSheet(
+                        "QPushButton#add_btn {"
+                        "  background: #161b22; color: #58a6ff;"
+                        "  border: 2px solid #3fb950;"
+                        "  border-radius: 8px;"
+                        "  font-family: 'JetBrains Mono','Noto Mono',monospace;"
+                        "  font-size: 11px; padding: 8px 4px; min-width: 58px;"
+                        "}"
+                        "QPushButton#add_btn:hover { background: #1a3a1f; color: #ffffff; border-color: #56d364; }"
+                    )
+                else:
+                    button.setStyleSheet("")
+
         def _position_window(self):
             try:
                 screen = QApplication.primaryScreen().availableGeometry()
@@ -660,6 +958,20 @@ if HAS_QT:
             if callable(self.on_log):
                 self.on_log(oz)
             self.close()
+
+        def _add_manual_amount(self):
+            text = self.manual_input.text().strip()
+            if not text:
+                return
+            try:
+                amount = float(text)
+            except ValueError:
+                QMessageBox.information(self, "Invalid amount", "Enter a number of ounces, e.g. 3 or 8.5.")
+                return
+            if amount <= 0:
+                QMessageBox.information(self, "Invalid amount", "Enter a positive number of ounces.")
+                return
+            self._log_and_close(amount)
 
         def _snooze_and_close(self, minutes):
             logging.info("Snoozed reminder for %s minutes", minutes)
@@ -680,6 +992,8 @@ if HAS_QT:
             self.next_reminder_at = None
             self.current_day = today_string()
             self._build_menu()
+            if within_active_hours(datetime.now()):
+                commit_missing_hourly_targets()
             self.refresh_state(reschedule=True)
 
             self.timer = QTimer(self.app)
@@ -800,6 +1114,8 @@ if HAS_QT:
 
         def refresh_state(self, reschedule=False):
             now = datetime.now()
+            if within_active_hours(now):
+                commit_missing_hourly_targets(now)
             drunk = total_oz(now)
             expected = expected_oz(now)
             _, pace_text = pace_summary(drunk, expected)
@@ -812,7 +1128,7 @@ if HAS_QT:
 
             next_text = self._next_reminder_text(now, drunk)
             self.next_action.setText(next_text)
-            tooltip = "\n".join(build_status_lines(now))
+            tooltip = "\n".join(build_status_lines(now, next_reminder_at=self.next_reminder_at))
             self.tray.setToolTip(tooltip)
             self.tray.setIcon(self._render_tray_icon(self._countdown_minutes(now, drunk)))
 
@@ -824,12 +1140,18 @@ if HAS_QT:
                 return
             expected = expected_oz(moment)
             interval = reminder_interval_minutes(moment, drunk=drunk, expected=expected)
-            self.next_reminder_at = moment + timedelta(minutes=interval)
+            last_time = last_entry_time(moment)
+            if last_time is not None:
+                candidate = last_time + timedelta(minutes=interval)
+                self.next_reminder_at = max(moment, candidate)
+            else:
+                self.next_reminder_at = moment + timedelta(minutes=interval)
             logging.info(
-                "Scheduled next reminder in %s minutes (drunk=%s expected=%s)",
+                "Scheduled next reminder in %s minutes (drunk=%s expected=%s last=%s)",
                 interval,
                 format_oz(drunk),
                 expected,
+                last_time.strftime("%H:%M:%S") if last_time else "none",
             )
 
         def _next_reminder_text(self, now, drunk):
@@ -852,6 +1174,10 @@ if HAS_QT:
                 self.refresh_state(reschedule=True)
                 return
 
+            # Lock in this hour's target before any drinking happens in it.
+            if within_active_hours(now):
+                commit_missing_hourly_targets(now)
+
             if self.next_reminder_at is None and within_active_hours(now) and total_oz(now) < TARGET_OZ:
                 self.schedule_next_reminder(now)
 
@@ -871,7 +1197,7 @@ if HAS_QT:
             self.popups = [item for item in self.popups if item.isVisible()]
 
         def show_manual_popup(self):
-            popup = WaterPopup(remind_mode=False, on_log=self._after_log)
+            popup = WaterPopup(remind_mode=False, on_log=self._after_log, next_reminder_at=self.next_reminder_at)
             popup.show()
             popup.raise_()
             if not is_wayland_session():
@@ -880,7 +1206,12 @@ if HAS_QT:
             self._remember_popup(popup)
 
         def show_reminder_popup(self):
-            popup = WaterPopup(remind_mode=True, on_log=self._after_log, on_snooze=self.snooze_reminder)
+            popup = WaterPopup(
+                remind_mode=True,
+                on_log=self._after_log,
+                on_snooze=self.snooze_reminder,
+                next_reminder_at=self.next_reminder_at,
+            )
             popup.show()
             popup.raise_()
             if not is_wayland_session():
