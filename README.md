@@ -54,6 +54,8 @@ The popup includes a gear button to open the settings dialog. Settings are persi
 - day start and end time with separate hour/minute selectors
 - 12-hour or 24-hour time entry mode
 - overnight schedules by setting end time at or before start time
+- custom quick-add buttons: show/hide individual buttons and adjust their oz amounts
+- reminder "aim for" parity: limit suggestions to odd, even, or both ounce values
 
 ## Data storage
 

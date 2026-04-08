@@ -29,7 +29,12 @@ DATA_DIR = Path.home() / ".local" / "share" / "water"
 PID_FILE = DATA_DIR / "tray.pid"
 TRAY_LOG_FILE = DATA_DIR / "tray.log"
 ICON_FILE = Path.home() / "bin" / "water-icon.svg"
-QUICK_ADD = [1, 2, 3, 4, 8, 12, 16, 20, 24]
+_DEFAULT_QUICK_ADD = [1, 2, 3, 4, 8, 12, 16, 20, 24]
+_QUICK_ADD_ALL_VALUES = list(_DEFAULT_QUICK_ADD)
+_QUICK_ADD_ALL_ENABLED = [True] * len(_DEFAULT_QUICK_ADD)
+QUICK_ADD = list(_DEFAULT_QUICK_ADD)
+AIM_FOR_ODD = True
+AIM_FOR_EVEN = True
 REMINDER_INPUT_GUARD_MS = 1400
 MIN_FUTURE_HOUR_OZ = 1.0
 LABELS = [
@@ -50,6 +55,7 @@ CONFIG_FILE = DATA_DIR / "config.json"
 def _apply_config():
     """Load saved settings into module-level constants."""
     global TARGET_OZ, DAY_START_HOUR, DAY_START_MINUTE, DAY_END_HOUR, DAY_END_MINUTE, USE_24H
+    global QUICK_ADD, _QUICK_ADD_ALL_VALUES, _QUICK_ADD_ALL_ENABLED, AIM_FOR_ODD, AIM_FOR_EVEN
     if not CONFIG_FILE.exists():
         return
     try:
@@ -66,11 +72,33 @@ def _apply_config():
             DAY_END_MINUTE = max(0, min(59, int(data["day_end_minute"])))
         if "use_24h" in data:
             USE_24H = bool(data["use_24h"])
+        # Load all-values; migrate from legacy 'quick_add' key if needed
+        values_raw = data.get("quick_add_values") or data.get("quick_add")
+        if isinstance(values_raw, list) and len(values_raw) == len(_DEFAULT_QUICK_ADD):
+            validated = []
+            for v in values_raw:
+                try:
+                    fv = float(v)
+                    validated.append(fv if fv > 0 else _DEFAULT_QUICK_ADD[len(validated)])
+                except (TypeError, ValueError):
+                    validated.append(_DEFAULT_QUICK_ADD[len(validated)])
+            _QUICK_ADD_ALL_VALUES = validated
+        enabled_raw = data.get("quick_add_enabled")
+        if isinstance(enabled_raw, list) and len(enabled_raw) == len(_DEFAULT_QUICK_ADD):
+            _QUICK_ADD_ALL_ENABLED = [bool(e) for e in enabled_raw]
+        QUICK_ADD = [
+            v for v, en in zip(_QUICK_ADD_ALL_VALUES, _QUICK_ADD_ALL_ENABLED) if en
+        ] or list(_DEFAULT_QUICK_ADD)
+        if "aim_for_odd" in data:
+            AIM_FOR_ODD = bool(data["aim_for_odd"])
+        if "aim_for_even" in data:
+            AIM_FOR_EVEN = bool(data["aim_for_even"])
     except (OSError, ValueError, KeyError):
         pass
 
 
-def save_config(target_oz, day_start_hour, day_start_minute, day_end_hour, day_end_minute, use_24h):
+def save_config(target_oz, day_start_hour, day_start_minute, day_end_hour, day_end_minute, use_24h,
+                quick_add_values=None, quick_add_enabled=None, aim_for_odd=True, aim_for_even=True):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text(
         json.dumps({
@@ -80,6 +108,10 @@ def save_config(target_oz, day_start_hour, day_start_minute, day_end_hour, day_e
             "day_end_hour": day_end_hour,
             "day_end_minute": day_end_minute,
             "use_24h": use_24h,
+            "quick_add_values": quick_add_values if quick_add_values is not None else list(_QUICK_ADD_ALL_VALUES),
+            "quick_add_enabled": quick_add_enabled if quick_add_enabled is not None else list(_QUICK_ADD_ALL_ENABLED),
+            "aim_for_odd": aim_for_odd,
+            "aim_for_even": aim_for_even,
         }),
         encoding="utf-8",
     )
@@ -464,6 +496,23 @@ def fallback_next_reminder_minutes(now=None):
     return max(1, math.ceil((next_hour - moment).total_seconds() / 60))
 
 
+def _apply_aim_parity(oz):
+    """Round oz to the nearest allowed parity (odd / even / both)."""
+    if (AIM_FOR_ODD and AIM_FOR_EVEN) or (not AIM_FOR_ODD and not AIM_FOR_EVEN):
+        return oz  # no filtering
+    v = max(1, int(round(oz)))
+    if AIM_FOR_ODD and not AIM_FOR_EVEN:
+        if v % 2 == 1:
+            return v
+        # v is even; prefer v-1 if ≥ 1, else v+1
+        return v - 1 if v - 1 >= 1 else v + 1
+    # AIM_FOR_EVEN and not AIM_FOR_ODD
+    if v % 2 == 0:
+        return max(2, v)
+    # v is odd; prefer v-1 if ≥ 2, else v+1
+    return v - 1 if v - 1 >= 2 else v + 1
+
+
 def suggested_next_oz(now, drunk, interval_minutes=None):
     """How many oz to aim for in the next reminder interval.
 
@@ -477,7 +526,8 @@ def suggested_next_oz(now, drunk, interval_minutes=None):
     hour_remaining = current_hour_remaining_target(now)
     if hour_remaining <= 0:
         return 0
-    return max(1, min(hour_remaining, int(math.ceil(remaining_oz))))
+    raw = max(1, min(hour_remaining, int(math.ceil(remaining_oz))))
+    return _apply_aim_parity(raw)
 
 
 def reminder_interval_minutes(now=None, drunk=None, expected=None):
@@ -588,6 +638,37 @@ def next_reminder_label_text(now, drunk, next_reminder_at=None):
     return f"   Next reminder: ~{next_minutes} min  →  current hour target met", 0
 
 
+def format_cup_equivalent(oz):
+    cups = oz / 8
+    total_eighths = int(round(cups * 8))
+    if math.isclose(cups, total_eighths / 8, abs_tol=1e-9):
+        whole_cups, remaining_eighths = divmod(total_eighths, 8)
+        fractions = {
+            1: "⅛",
+            2: "¼",
+            3: "⅜",
+            4: "½",
+            5: "⅝",
+            6: "¾",
+            7: "⅞",
+        }
+        if remaining_eighths and whole_cups:
+            amount = f"{whole_cups}{fractions[remaining_eighths]}"
+        elif remaining_eighths:
+            amount = fractions[remaining_eighths]
+        else:
+            amount = str(whole_cups)
+        unit = "cup" if total_eighths <= 8 else "cups"
+        return f"{amount} {unit}"
+
+    unit = "cup" if math.isclose(cups, 1.0, abs_tol=1e-9) else "cups"
+    return f"{format_oz(cups)} {unit}"
+
+
+def suggested_button_label(oz):
+    return f"{format_oz(oz)} oz\n{format_cup_equivalent(oz)}"
+
+
 def read_pid():
     if not PID_FILE.exists():
         return None
@@ -654,6 +735,7 @@ try:
         QProgressBar,
         QPushButton,
         QLineEdit,
+        QScrollArea,
         QSpinBox,
         QStyle,
         QSystemTrayIcon,
@@ -738,6 +820,55 @@ QFrame#divider {
 
 if HAS_QT:
 
+    class AmountButton(QPushButton):
+        _COLOR_NORMAL = "#58a6ff"
+        _COLOR_HOVER  = "#ffffff"
+
+        def __init__(self, label, parent=None):
+            super().__init__("", parent)
+            self.setObjectName("add_btn")
+            self.setMinimumHeight(62)
+
+            primary_text, secondary_text = (label.split("\n", 1) + [""])[:2]
+
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(4, 5, 4, 5)
+            layout.setSpacing(0)
+
+            self.primary_label = QLabel(primary_text, self)
+            self.primary_label.setAlignment(Qt.AlignHCenter | Qt.AlignBottom)
+            self.primary_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            primary_font = QFont("JetBrains Mono")
+            primary_font.setPointSize(13)
+            self.primary_label.setFont(primary_font)
+            layout.addWidget(self.primary_label)
+
+            self.secondary_label = QLabel(secondary_text, self)
+            self.secondary_label.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+            self.secondary_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            secondary_font = QFont("JetBrains Mono")
+            secondary_font.setPointSize(13)
+            self.secondary_label.setFont(secondary_font)
+            layout.addWidget(self.secondary_label)
+
+            if not secondary_text:
+                self.secondary_label.hide()
+
+            self._apply_label_color(self._COLOR_NORMAL)
+
+        def _apply_label_color(self, color):
+            style = f"color: {color}; background: transparent;"
+            self.primary_label.setStyleSheet(style)
+            self.secondary_label.setStyleSheet(style)
+
+        def enterEvent(self, event):
+            super().enterEvent(event)
+            self._apply_label_color(self._COLOR_HOVER)
+
+        def leaveEvent(self, event):
+            super().leaveEvent(event)
+            self._apply_label_color(self._COLOR_NORMAL)
+
     class DailyBarChart(QWidget):
         """Bar chart showing hourly expected vs consumed over the active day."""
 
@@ -778,8 +909,7 @@ if HAS_QT:
 
             all_exp = list(combined_exp.values())
             max_exp = max(all_exp) if all_exp else 8.0
-            max_actual = max(self.hourly.values()) if self.hourly else 0.0
-            max_oz = max(max_exp, max_actual or 8.0) * 2.2
+            max_oz = max(max_exp, 8.0) * 2.2
 
             slot_w = chart_w / len(hours)
             bar_w = max(3, slot_w * 0.78)
@@ -1049,40 +1179,27 @@ if HAS_QT:
             button_label.setObjectName("status")
             root.addWidget(button_label)
 
-            row_one = QHBoxLayout()
-            row_one.setSpacing(6)
-            row_two = QHBoxLayout()
-            row_two.setSpacing(6)
-            row_three = QHBoxLayout()
-            row_three.setSpacing(6)
+            self._btn_row_1 = QHBoxLayout()
+            self._btn_row_1.setSpacing(6)
+            self._btn_row_2 = QHBoxLayout()
+            self._btn_row_2.setSpacing(6)
+            self._btn_row_3 = QHBoxLayout()
+            self._btn_row_3.setSpacing(6)
+            self._rendered_quick_add = list(QUICK_ADD)
 
-            for index, (oz, label) in enumerate(zip(QUICK_ADD, LABELS)):
-                button = QPushButton(label)
-                button.setObjectName("add_btn")
-                button.amount = oz
+            for index, oz in enumerate(QUICK_ADD):
+                button = self._make_add_button(oz, highlighted=(oz == sip))
                 self.quick_buttons.append(button)
-                if oz == sip:
-                    button.setStyleSheet(
-                        "QPushButton#add_btn {"
-                        "  background: #161b22; color: #58a6ff;"
-                        "  border: 2px solid #3fb950;"
-                        "  border-radius: 8px;"
-                        "  font-family: 'JetBrains Mono','Noto Mono',monospace;"
-                        "  font-size: 11px; padding: 8px 4px; min-width: 58px;"
-                        "}"
-                        "QPushButton#add_btn:hover { background: #1a3a1f; color: #ffffff; border-color: #56d364; }"
-                    )
-                button.clicked.connect(lambda checked=False, amount=oz: self._log_and_close(amount))
                 if index < 3:
-                    row_one.addWidget(button)
+                    self._btn_row_1.addWidget(button)
                 elif index < 6:
-                    row_two.addWidget(button)
+                    self._btn_row_2.addWidget(button)
                 else:
-                    row_three.addWidget(button)
+                    self._btn_row_3.addWidget(button)
 
-            root.addLayout(row_one)
-            root.addLayout(row_two)
-            root.addLayout(row_three)
+            root.addLayout(self._btn_row_1)
+            root.addLayout(self._btn_row_2)
+            root.addLayout(self._btn_row_3)
 
             divider_two = QFrame()
             divider_two.setObjectName("divider")
@@ -1093,8 +1210,12 @@ if HAS_QT:
             manual_label.setObjectName("status")
             root.addWidget(manual_label)
 
-            manual_row = QHBoxLayout()
-            manual_row.setSpacing(6)
+            self._manual_row = QHBoxLayout()
+            self._manual_row.setSpacing(6)
+            if sip > 0 and sip not in QUICK_ADD:
+                suggested_button = self._make_add_button(sip, highlighted=True)
+                self.quick_buttons.append(suggested_button)
+                self._manual_row.addWidget(suggested_button)
             self.manual_input = QLineEdit()
             self.manual_input.setPlaceholderText("Enter oz")
             self.manual_input.setFixedWidth(86)
@@ -1109,9 +1230,9 @@ if HAS_QT:
             manual_button = QPushButton("Add")
             manual_button.setObjectName("add_btn")
             manual_button.clicked.connect(self._add_manual_amount)
-            manual_row.addWidget(self.manual_input)
-            manual_row.addWidget(manual_button)
-            root.addLayout(manual_row)
+            self._manual_row.addWidget(self.manual_input)
+            self._manual_row.addWidget(manual_button)
+            root.addLayout(self._manual_row)
 
             if self.remind_mode:
                 snooze_label = QLabel("Snooze reminder:")
@@ -1239,10 +1360,61 @@ if HAS_QT:
                 self.next_label.setText(f"   Reminders pause outside {active_window_label()}")
                 sip = 0
 
-            self._update_button_highlight(sip)
+            if list(QUICK_ADD) != self._rendered_quick_add:
+                self._rebuild_quick_buttons(sip)
+            else:
+                self._update_button_highlight(sip)
             self.chart.snapshot = now
             self.chart.hourly = hourly_oz(now)
             self.chart.update()
+
+        def _make_add_button(self, oz, highlighted=False):
+            button = AmountButton(suggested_button_label(oz))
+            button.amount = oz
+            if highlighted:
+                button.setStyleSheet(
+                    "QPushButton#add_btn {"
+                    "  background: #161b22; color: #58a6ff;"
+                    "  border: 2px solid #3fb950;"
+                    "  border-radius: 8px;"
+                    "  font-family: 'JetBrains Mono','Noto Mono',monospace;"
+                    "  font-size: 11px; padding: 8px 4px; min-width: 58px;"
+                    "}"
+                    "QPushButton#add_btn:hover { background: #1a3a1f; color: #ffffff; border-color: #56d364; }"
+                )
+            button.clicked.connect(lambda checked=False, amount=oz: self._log_and_close(amount))
+            return button
+
+        def _rebuild_quick_buttons(self, sip):
+            for row in (self._btn_row_1, self._btn_row_2, self._btn_row_3):
+                while row.count():
+                    item = row.takeAt(0)
+                    if item.widget():
+                        item.widget().deleteLater()
+            # Remove any suggested button that precedes manual_input in _manual_row
+            while self._manual_row.count() > 0:
+                item = self._manual_row.itemAt(0)
+                if item and item.widget() is self.manual_input:
+                    break
+                item = self._manual_row.takeAt(0)
+                if item and item.widget():
+                    item.widget().deleteLater()
+            self.quick_buttons = []
+            for index, oz in enumerate(QUICK_ADD):
+                btn = self._make_add_button(oz, highlighted=(oz == sip))
+                self.quick_buttons.append(btn)
+                if index < 3:
+                    self._btn_row_1.addWidget(btn)
+                elif index < 6:
+                    self._btn_row_2.addWidget(btn)
+                else:
+                    self._btn_row_3.addWidget(btn)
+            if sip > 0 and sip not in QUICK_ADD:
+                suggested = self._make_add_button(sip, highlighted=True)
+                self.quick_buttons.append(suggested)
+                self._manual_row.insertWidget(0, suggested)
+            self._rendered_quick_add = list(QUICK_ADD)
+            self.adjustSize()
 
         def _update_button_highlight(self, sip):
             for button in self.quick_buttons:
@@ -1306,6 +1478,7 @@ if HAS_QT:
         def _open_configure(self):
             if callable(self.on_configure):
                 self.on_configure()
+                self._refresh_dynamic_display()
 
 
     class ConfigDialog(QDialog):
@@ -1327,6 +1500,9 @@ if HAS_QT:
                 "QSpinBox { background: #161b22; color: #c9d1d9; border: 1px solid #30363d;"
                 "           border-radius: 6px; padding: 4px 8px;"
                 "           font-family: 'JetBrains Mono','Noto Mono',monospace; }"
+                "QLineEdit { background: #161b22; color: #c9d1d9; border: 1px solid #30363d;"
+                "            border-radius: 6px; padding: 4px 6px;"
+                "            font-family: 'JetBrains Mono','Noto Mono',monospace; font-size: 12px; }"
                 "QCheckBox { color: #c9d1d9; font-family: 'JetBrains Mono','Noto Mono',monospace; font-size: 12px; }"
                 "QPushButton { background: #161b22; color: #58a6ff; border: 1px solid #30363d;"
                 "              border-radius: 6px; padding: 5px 14px; }"
@@ -1367,6 +1543,99 @@ if HAS_QT:
             form.addRow("", hint)
 
             layout.addLayout(form)
+
+            # --- Quick add button amounts ---
+            div1 = QFrame()
+            div1.setFrameShape(QFrame.HLine)
+            div1.setStyleSheet("color: #30363d;")
+            layout.addWidget(div1)
+
+            quick_lbl = QLabel("Quick add buttons — check to show, edit oz value:")
+            quick_lbl.setStyleSheet(
+                "color: #c9d1d9; font-weight: bold;"
+                "font-family: 'JetBrains Mono','Noto Mono',monospace; font-size: 12px;"
+            )
+            layout.addWidget(quick_lbl)
+
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFixedHeight(220)
+            scroll.setStyleSheet(
+                "QScrollArea { border: 1px solid #30363d; border-radius: 6px; background: #0d1117; }"
+                "QScrollBar:vertical { background: #161b22; width: 8px; }"
+                "QScrollBar::handle:vertical { background: #30363d; border-radius: 4px; }"
+            )
+            inner = QWidget()
+            inner.setStyleSheet("background: #0d1117;")
+            inner_layout = QVBoxLayout(inner)
+            inner_layout.setContentsMargins(6, 6, 6, 6)
+            inner_layout.setSpacing(4)
+
+            self.quick_checks = []
+            self.quick_edits = []
+            for i, (current_oz, default_oz, enabled) in enumerate(
+                zip(_QUICK_ADD_ALL_VALUES, _DEFAULT_QUICK_ADD, _QUICK_ADD_ALL_ENABLED)
+            ):
+                row_w = QWidget()
+                row_l = QHBoxLayout(row_w)
+                row_l.setContentsMargins(2, 2, 2, 2)
+                row_l.setSpacing(8)
+
+                cb = QCheckBox()
+                cb.setToolTip("Show this button on the main panel")
+                cb.setChecked(enabled)
+                edit = QLineEdit()
+                edit.setText(format_oz(current_oz))
+                edit.setFixedWidth(70)
+                edit.setPlaceholderText("oz")
+                btn_lbl = QLabel(f"oz  (default: {format_oz(default_oz)})")
+
+                row_l.addWidget(cb)
+                row_l.addWidget(edit)
+                row_l.addWidget(btn_lbl)
+                row_l.addStretch()
+
+                self.quick_checks.append(cb)
+                self.quick_edits.append(edit)
+                inner_layout.addWidget(row_w)
+
+            inner_layout.addStretch()
+            scroll.setWidget(inner)
+            layout.addWidget(scroll)
+
+            # --- Aim for oz parity ---
+            div2 = QFrame()
+            div2.setFrameShape(QFrame.HLine)
+            div2.setStyleSheet("color: #30363d;")
+            layout.addWidget(div2)
+
+            parity_lbl = QLabel("'Aim for' oz parity:")
+            parity_lbl.setStyleSheet(
+                "color: #c9d1d9; font-weight: bold;"
+                "font-family: 'JetBrains Mono','Noto Mono',monospace; font-size: 12px;"
+            )
+            layout.addWidget(parity_lbl)
+
+            parity_hint = QLabel(
+                "Which parity the reminder's 'aim for' suggestion may use. Both checked = no restriction."
+            )
+            parity_hint.setWordWrap(True)
+            parity_hint.setStyleSheet(
+                "color: #8b949e; font-size: 11px;"
+                "font-family: 'JetBrains Mono','Noto Mono',monospace;"
+            )
+            layout.addWidget(parity_hint)
+
+            parity_row = QHBoxLayout()
+            parity_row.setSpacing(16)
+            self.cb_odd = QCheckBox("Odd")
+            self.cb_odd.setChecked(AIM_FOR_ODD)
+            self.cb_even = QCheckBox("Even")
+            self.cb_even.setChecked(AIM_FOR_EVEN)
+            parity_row.addWidget(self.cb_odd)
+            parity_row.addWidget(self.cb_even)
+            parity_row.addStretch()
+            layout.addLayout(parity_row)
 
             buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
             buttons.accepted.connect(self._accept)
@@ -1464,7 +1733,21 @@ if HAS_QT:
         def values(self):
             sh, sm = self._read_time(self.start_h, self.start_m, self.start_ampm)
             eh, em = self._read_time(self.end_h, self.end_m, self.end_ampm)
-            return self.target_spin.value(), sh, sm, eh, em, self.use_24h.isChecked()
+            quick_add_values = []
+            quick_add_enabled = []
+            for i, (cb, edit) in enumerate(zip(self.quick_checks, self.quick_edits)):
+                try:
+                    v = float(edit.text().strip())
+                    quick_add_values.append(max(0.1, v))
+                except ValueError:
+                    quick_add_values.append(_DEFAULT_QUICK_ADD[i])
+                quick_add_enabled.append(cb.isChecked())
+            aim_for_odd = self.cb_odd.isChecked()
+            aim_for_even = self.cb_even.isChecked()
+            return (
+                self.target_spin.value(), sh, sm, eh, em, self.use_24h.isChecked(),
+                quick_add_values, quick_add_enabled, aim_for_odd, aim_for_even,
+            )
 
     class WaterTray:
         def __init__(self, app):
@@ -1815,8 +2098,8 @@ if HAS_QT:
         def show_config(self):
             dialog = ConfigDialog()
             if dialog.exec_() == QDialog.Accepted:
-                target_oz, sh, sm, eh, em, use_24h = dialog.values()
-                save_config(target_oz, sh, sm, eh, em, use_24h)
+                target_oz, sh, sm, eh, em, use_24h, quick_add_values, quick_add_enabled, aim_for_odd, aim_for_even = dialog.values()
+                save_config(target_oz, sh, sm, eh, em, use_24h, quick_add_values, quick_add_enabled, aim_for_odd, aim_for_even)
                 _apply_config()
                 logging.info(
                     "Settings updated: target=%s oz  start=%02d:%02d  end=%02d:%02d",
