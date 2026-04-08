@@ -4,6 +4,8 @@ A small KDE Plasma hydration tracker for tracking daily water intake.
 
 This repository contains a lightweight shell wrapper and Python popup/tray UI for logging water in ounces, showing progress toward a 101 oz daily target, and optionally running as a persistent KDE system tray app.
 
+The current pacing model aims for steady hydration across the active day rather than front-loading most of the target into the morning.
+
 ## Contents
 
 - `water` — CLI wrapper script for logging intake, showing status, and controlling the tray app
@@ -42,7 +44,16 @@ Run the `water` command from a terminal:
 - `water cron` — install legacy cron reminders
 - `water uncron` — remove legacy cron reminders
 - `water log` — show today’s full log
-- `water schedule` — show today’s reminder schedule
+- `water schedule` — show the steady hourly pacing plan
+
+## Settings
+
+The popup includes a gear button to open the settings dialog. Settings are persisted in `~/.local/share/water/config.json` and include:
+
+- daily target in ounces
+- day start and end time with separate hour/minute selectors
+- 12-hour or 24-hour time entry mode
+- overnight schedules by setting end time at or before start time
 
 ## Data storage
 

@@ -22,7 +22,10 @@
 TARGET_OZ=101
 DAY_START_HOUR=7
 DAY_END_HOUR=21
+BASE_REMINDER_INTERVAL=45
 DATA_DIR="${HOME}/.local/share/water"
+# NOTE: ~/bin is a directory symlink to this project folder.
+# water-popup.py is reached through that symlink — do not copy or re-link it.
 POPUP_SCRIPT="${HOME}/bin/water-popup.py"
 PID_FILE="${DATA_DIR}/tray.pid"
 TODAY=$(date +%Y-%m-%d)
@@ -73,15 +76,31 @@ expected_oz() {
   echo $(( TARGET_OZ * elapsed / day_min ))
 }
 
-# Bell curve weight 0-100 for a given hour (peak at 12-13, taper morning/eve)
-bell_weight() {
-  local hour=$1
-  python3 -c "
-import math
-h=$hour; center=12.5; sigma=3.5
-w = math.exp(-((h-center)**2)/(2*sigma**2))
-print(int(w * 100))
-"
+steady_reminder_interval() {
+  local h drunk expected deficit interval
+  h=$(date +%-H)
+  drunk=$(total_oz)
+  expected=$(expected_oz)
+  deficit=$(( expected - drunk ))
+  interval=$BASE_REMINDER_INTERVAL
+
+  if (( deficit >= 20 )); then
+    interval=15
+  elif (( deficit >= 10 )); then
+    interval=30
+  elif (( deficit > 0 )); then
+    interval=45
+  else
+    interval=60
+  fi
+
+  if (( h >= 20 && interval < 60 )); then
+    interval=60
+  elif (( h >= 18 && interval < 45 )); then
+    interval=45
+  fi
+
+  echo "$interval"
 }
 
 bar() {
@@ -121,10 +140,9 @@ cmd_status() {
   local h; h=$(date +%-H)
   (( h >= 20 )) && echo -e "  ${YLW}🌙 Evening — taper off to protect sleep${RST}"
 
-  local w interval
-  w=$(bell_weight "$h")
-  interval=$(( 90 - (w * 70 / 100) ))
-  echo -e "  ${CYN}Next reminder: ~${interval} min  (bell weight ${w}%)${RST}"
+  local interval
+  interval=$(steady_reminder_interval)
+  echo -e "  ${CYN}Next reminder: ~${interval} min  (steady pace)${RST}"
   echo ""
 }
 
@@ -237,20 +255,19 @@ cmd_log_view() {
   echo ""
 }
 
-# Bell-curve reminder: decide whether to fire based on current hour's weight
-# Each cron tick (every 15 min) rolls dice weighted by bell curve
+# Legacy cron reminder: fire on a steady cadence, tightening only when behind pace.
 cmd_remind() {
-  local h; h=$(date +%-H)
+  local h minute interval elapsed_since_start
+  h=$(date +%-H)
   (( h < DAY_START_HOUR || h >= DAY_END_HOUR )) && exit 0
 
   local drunk; drunk=$(total_oz)
   (( drunk >= TARGET_OZ )) && exit 0   # goal met — no more reminders
 
-  # Probabilistic firing based on bell weight
-  # weight 100 = always fire; weight 20 = fire ~20% of ticks
-  local w; w=$(bell_weight "$h")
-  local roll=$(( RANDOM % 100 ))
-  (( roll >= w )) && exit 0   # skip this tick
+  minute=$(date +%-M)
+  interval=$(steady_reminder_interval)
+  elapsed_since_start=$(( (h - DAY_START_HOUR) * 60 + minute ))
+  (( elapsed_since_start % interval != 0 )) && exit 0
 
   # Fire the popup
   cmd_popup remind
@@ -258,29 +275,28 @@ cmd_remind() {
 
 cmd_schedule() {
   echo ""
-  echo -e "  ${BOLD}📅 Bell-curve reminder schedule${RST}"
-  echo -e "  Hour  │ Intensity │ Avg interval"
-  echo -e "  ──────┼───────────┼─────────────"
+  echo -e "  ${BOLD}📅 Steady hydration plan${RST}"
+  echo -e "  Hour  │ Cumulative target"
+  echo -e "  ──────┼──────────────────"
+  local day_min=$(( (DAY_END_HOUR - DAY_START_HOUR) * 60 ))
   for h in 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    local w; w=$(bell_weight "$h")
-    local interval=$(( 90 - (w * 70 / 100) ))
-    local bar_len=$(( w / 5 ))
-    local bar_str; bar_str=$(printf '%*s' "$bar_len" '' | tr ' ' '▮')
-    printf "  %02d:00  │ %-10s│ ~%d min\n" "$h" "$bar_str" "$interval"
+    local elapsed=$(( (h + 1 - DAY_START_HOUR) * 60 ))
+    local target=$(( TARGET_OZ * elapsed / day_min ))
+    printf "  %02d:59  │ %3d oz by end of hour\n" "$h" "$target"
   done
   echo ""
-  echo -e "  ${CYN}Tray mode uses these intervals directly; legacy cron used 15 min checks${RST}"
+  echo -e "  ${CYN}Legacy cron reminders check every 15 min and only tighten if you fall behind pace${RST}"
   echo ""
 }
 
 cmd_cron_install() {
   local script_path; script_path=$(realpath "$0")
-  # Single cron entry every 15 min — bell curve is handled inside `water remind`
+  # Single cron entry every 15 min — steady cadence is handled inside `water remind`
   local cron_line="*/15 7-20 * * * DISPLAY=:0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$(id -u)/bus $script_path remind >> ${DATA_DIR}/remind.log 2>&1"
 
   (crontab -l 2>/dev/null | grep -v "water remind"; echo "$cron_line") | crontab -
 
-  echo -e "${GRN}✓ Cron installed — checks every 15 min, fires probabilistically via bell curve${RST}"
+  echo -e "${GRN}✓ Cron installed — checks every 15 min and reminds on a steady pace${RST}"
   echo ""
   echo -e "  ${BLU}Schedule preview:${RST}"
   cmd_schedule
@@ -312,7 +328,7 @@ cmd_help() {
   echo -e "    water undo         Remove last entry"
   echo -e "    water reset        Clear today"
   echo -e "    water log          Full entry list"
-  echo -e "    water schedule     Show bell-curve reminder schedule"
+  echo -e "    water schedule     Show steady hourly pace"
   echo -e "    water cron         Install legacy cron reminders"
   echo -e "    water uncron       Remove legacy cron reminders"
   echo ""

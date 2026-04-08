@@ -21,23 +21,71 @@ from pathlib import Path
 
 TARGET_OZ = 101
 DAY_START_HOUR = 7
+DAY_START_MINUTE = 0
 DAY_END_HOUR = 21
+DAY_END_MINUTE = 0
+USE_24H = False
 DATA_DIR = Path.home() / ".local" / "share" / "water"
 PID_FILE = DATA_DIR / "tray.pid"
 TRAY_LOG_FILE = DATA_DIR / "tray.log"
 ICON_FILE = Path.home() / "bin" / "water-icon.svg"
 QUICK_ADD = [1, 2, 3, 4, 8, 12, 16, 20, 24]
+REMINDER_INPUT_GUARD_MS = 1400
+MIN_FUTURE_HOUR_OZ = 1.0
 LABELS = [
-    "1 oz\nsip",
-    "2 oz\nsip",
-    "3 oz\nsip",
-    "4 oz\nsip",
-    "8 oz\n1/2 cup",
-    "12 oz\nmug",
-    "16 oz\nglass",
-    "20 oz\nlarge",
-    "24 oz\nbottle",
+    "1 oz\n\u215b cup",
+    "2 oz\n\u00bc cup",
+    "3 oz\n\u215c cup",
+    "4 oz\n\u00bd cup",
+    "8 oz\n1 cup",
+    "12 oz\n1\u00bd cups",
+    "16 oz\n2 cups",
+    "20 oz\n2\u00bd cups",
+    "24 oz\n3 cups",
 ]
+
+CONFIG_FILE = DATA_DIR / "config.json"
+
+
+def _apply_config():
+    """Load saved settings into module-level constants."""
+    global TARGET_OZ, DAY_START_HOUR, DAY_START_MINUTE, DAY_END_HOUR, DAY_END_MINUTE, USE_24H
+    if not CONFIG_FILE.exists():
+        return
+    try:
+        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        if "target_oz" in data:
+            TARGET_OZ = max(1, int(data["target_oz"]))
+        if "day_start_hour" in data:
+            DAY_START_HOUR = max(0, min(23, int(data["day_start_hour"])))
+        if "day_start_minute" in data:
+            DAY_START_MINUTE = max(0, min(59, int(data["day_start_minute"])))
+        if "day_end_hour" in data:
+            DAY_END_HOUR = max(0, min(23, int(data["day_end_hour"])))
+        if "day_end_minute" in data:
+            DAY_END_MINUTE = max(0, min(59, int(data["day_end_minute"])))
+        if "use_24h" in data:
+            USE_24H = bool(data["use_24h"])
+    except (OSError, ValueError, KeyError):
+        pass
+
+
+def save_config(target_oz, day_start_hour, day_start_minute, day_end_hour, day_end_minute, use_24h):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(
+        json.dumps({
+            "target_oz": target_oz,
+            "day_start_hour": day_start_hour,
+            "day_start_minute": day_start_minute,
+            "day_end_hour": day_end_hour,
+            "day_end_minute": day_end_minute,
+            "use_24h": use_24h,
+        }),
+        encoding="utf-8",
+    )
+
+
+_apply_config()
 
 
 def today_string(now=None):
@@ -132,34 +180,70 @@ def expected_oz(now=None):
     moment = now or datetime.now()
     hour = moment.hour
     minute = moment.minute
-    if hour < DAY_START_HOUR:
+    hours = active_hours_list()
+    if not hours:
         return 0
-    if hour >= DAY_END_HOUR:
-        return TARGET_OZ
-    day_minutes = (DAY_END_HOUR - DAY_START_HOUR) * 60
-    elapsed = (hour - DAY_START_HOUR) * 60 + minute
+    if not within_active_hours(moment):
+        # Before window starts → 0; after it ends → full target
+        # Determine by checking if we're "past" the end in the day order
+        if DAY_START_HOUR < DAY_END_HOUR:
+            return 0 if hour < DAY_START_HOUR else TARGET_OZ
+        # Overnight: hours between end and start are the "off" period
+        return TARGET_OZ if DAY_END_HOUR <= hour < DAY_START_HOUR else 0
+    day_minutes = len(hours) * 60
+    # Position within the ordered active hours list
+    if hour in hours:
+        idx = hours.index(hour)
+    else:
+        idx = 0
+    elapsed = idx * 60 + minute
     return int(TARGET_OZ * elapsed / day_minutes)
 
 
-def bell_weight(hour):
-    # Peak at 10am, drops steeply after 3pm — front-loads for losartan, protects sleep
-    center, sigma = 10.0, 3.0
-    return math.exp(-((hour - center) ** 2) / (2 * sigma**2))
+def distribute_hourly_targets(hours, total_oz, current_hour=None, current_hour_fraction=1.0):
+    """Spread remaining ounces steadily across the available hours.
+
+    Future full hours keep a small floor whenever enough ounces remain so the
+    late-day plan does not collapse into zeros after an early push.
+    """
+    if not hours or total_oz <= 0:
+        return {}
+
+    slot_weights = {}
+    floor_targets = {}
+    for hour in hours:
+        slot_fraction = current_hour_fraction if hour == current_hour else 1.0
+        slot_weights[hour] = max(0.0, slot_fraction)
+        floor_targets[hour] = 0.0 if hour == current_hour else MIN_FUTURE_HOUR_OZ
+
+    floor_total = sum(floor_targets.values())
+    if floor_total > total_oz and floor_total > 0:
+        scale = total_oz / floor_total
+        floor_targets = {hour: value * scale for hour, value in floor_targets.items()}
+        floor_total = total_oz
+
+    remaining_oz = max(0.0, total_oz - floor_total)
+    total_weight = sum(slot_weights.values()) or 1.0
+    return {
+        hour: floor_targets[hour] + remaining_oz * slot_weights[hour] / total_weight
+        for hour in hours
+    }
 
 
-def hourly_expected_weighted():
-    """Baseline expected oz per hour, bell-curve weighted, summing to TARGET_OZ."""
-    hours = range(DAY_START_HOUR, DAY_END_HOUR)
-    weights = {h: bell_weight(h + 0.5) for h in hours}
-    total_w = sum(weights.values())
-    return {h: TARGET_OZ * w / total_w for h, w in weights.items()}
+def hourly_expected_steady():
+    """Baseline steady oz targets per hour, summing to TARGET_OZ."""
+    return distribute_hourly_targets(active_hours_list(), TARGET_OZ)
 
 
 def adjusted_future_expected(now, drunk):
-    """Redistribute remaining oz over current+future hours, bell-curve weighted."""
+    """Redistribute remaining oz over current+future hours with a steady pace."""
     current_hour = now.hour
     remaining_oz = max(0.0, TARGET_OZ - drunk)
-    future_hours = [h for h in range(max(current_hour, DAY_START_HOUR), DAY_END_HOUR)]
+    hours = active_hours_list()
+    if current_hour in hours:
+        future_hours = hours[hours.index(current_hour):]
+    else:
+        future_hours = []
     if not future_hours:
         return {}
 
@@ -167,16 +251,12 @@ def adjusted_future_expected(now, drunk):
         0.0,
         1.0 - ((now.minute * 60 + now.second) / 3600),
     )
-
-    weights = {}
-    for hour in future_hours:
-        hour_weight = bell_weight(hour + 0.5)
-        if hour == current_hour:
-            hour_weight *= remaining_hour_fraction
-        weights[hour] = hour_weight
-
-    total_w = sum(weights.values()) or 1.0
-    return {h: remaining_oz * w / total_w for h, w in weights.items()}
+    return distribute_hourly_targets(
+        future_hours,
+        remaining_oz,
+        current_hour=current_hour,
+        current_hour_fraction=remaining_hour_fraction,
+    )
 
 
 def _committed_targets_path(now=None):
@@ -202,14 +282,19 @@ def commit_hourly_targets(now=None, drunk=None):
 def commit_missing_hourly_targets(now=None):
     """Persist hour-start targets for any missing hours up to the current hour."""
     moment = now or datetime.now()
-    if moment.hour < DAY_START_HOUR:
+    if not within_active_hours(moment):
         return load_committed_targets(moment)
 
     committed = load_committed_targets(moment)
-    last_hour = min(moment.hour, DAY_END_HOUR - 1)
+    hours = active_hours_list()
+    current_hour = moment.hour
+    if current_hour in hours:
+        hours_to_commit = hours[: hours.index(current_hour) + 1]
+    else:
+        hours_to_commit = []
     changed = False
 
-    for hour in range(DAY_START_HOUR, last_hour + 1):
+    for hour in hours_to_commit:
         if hour in committed:
             continue
         hour_start = moment.replace(hour=hour, minute=0, second=0, microsecond=0)
@@ -240,7 +325,7 @@ def rounded_distribution(values, target_total=None):
 
     ranked_keys = sorted(
         values,
-        key=lambda key: (values[key] - math.floor(values[key]), -key),
+        key=lambda key: (values[key] - math.floor(values[key]), key),
         reverse=True,
     )
 
@@ -313,17 +398,22 @@ def live_hour_target(now=None):
 
 def committed_expected_oz(now=None):
     moment = now or datetime.now()
-    if moment.hour < DAY_START_HOUR:
-        return 0
-    if moment.hour >= DAY_END_HOUR:
-        return TARGET_OZ
+    if not within_active_hours(moment):
+        if DAY_START_HOUR < DAY_END_HOUR:
+            return 0 if moment.hour < DAY_START_HOUR else TARGET_OZ
+        return TARGET_OZ if DAY_END_HOUR <= moment.hour < DAY_START_HOUR else 0
 
     committed = commit_missing_hourly_targets(moment)
-    baseline = hourly_expected_weighted()
-    last_hour = min(moment.hour, DAY_END_HOUR - 1)
+    baseline = hourly_expected_steady()
+    hours = active_hours_list()
+    current_hour = moment.hour
+    if current_hour in hours:
+        hours_so_far = hours[: hours.index(current_hour) + 1]
+    else:
+        hours_so_far = []
     return sum(
         max(0, round_oz_int(committed.get(hour, baseline.get(hour, 0))))
-        for hour in range(DAY_START_HOUR, last_hour + 1)
+        for hour in hours_so_far
     )
 
 
@@ -392,40 +482,60 @@ def suggested_next_oz(now, drunk, interval_minutes=None):
 
 def reminder_interval_minutes(now=None, drunk=None, expected=None):
     moment = now or datetime.now()
-    fractional_hour = moment.hour + (moment.minute / 60)
-    weight = bell_weight(fractional_hour)
-    base_interval = int(90 - (weight * 70))
+    if not within_active_hours(moment):
+        return 0
 
     current_drunk = total_oz(moment) if drunk is None else drunk
-    current_expected = expected_oz(moment) if expected is None else expected
+    current_expected = committed_expected_oz(moment) if expected is None else expected
     deficit = max(0, current_expected - current_drunk)
 
-    if deficit <= 0:
-        return base_interval
-
     if deficit >= 20:
-        reduction = 0.45
+        interval = 20
     elif deficit >= 10:
-        reduction = 0.30
+        interval = 30
+    elif deficit > 0:
+        interval = 40
     else:
-        reduction = 0.15
+        interval = 50
 
-    if moment.hour >= 20:
-        reduction *= 0.35
-        minimum_interval = 30
-    elif moment.hour >= 18:
-        reduction *= 0.60
-        minimum_interval = 20
-    else:
-        minimum_interval = 8
+    # Slow reminders down near the end of the active window.
+    hours = active_hours_list()
+    if hours and moment.hour in hours:
+        idx = hours.index(moment.hour)
+        remaining_hours = len(hours) - idx
+        if remaining_hours <= 1:
+            return max(45, interval)
+        if remaining_hours <= 3:
+            return max(30, interval)
+    return interval
 
-    adjusted_interval = int(base_interval * (1 - reduction))
-    return max(minimum_interval, adjusted_interval)
+
+def active_hours_list():
+    """Ordered list of calendar hours in the active window (handles overnight spans)."""
+    if DAY_START_HOUR < DAY_END_HOUR:
+        return list(range(DAY_START_HOUR, DAY_END_HOUR))
+    # Overnight: e.g. start=21, end=8 → [21,22,23,0,1,2,3,4,5,6,7]
+    return list(range(DAY_START_HOUR, 24)) + list(range(0, DAY_END_HOUR))
+
+
+def active_window_label():
+    """Human-readable string like '7 AM - 9 PM' or '9 PM - 8 AM'."""
+    def fmt(h):
+        suffix = "AM" if h < 12 else "PM"
+        display = h % 12 or 12
+        return f"{display} {suffix}"
+    return f"{fmt(DAY_START_HOUR)} - {fmt(DAY_END_HOUR)}"
 
 
 def within_active_hours(now=None):
     moment = now or datetime.now()
-    return DAY_START_HOUR <= moment.hour < DAY_END_HOUR
+    t = moment.hour * 60 + moment.minute
+    s = DAY_START_HOUR * 60 + DAY_START_MINUTE
+    e = DAY_END_HOUR * 60 + DAY_END_MINUTE
+    if s < e:
+        return s <= t < e
+    # Overnight span
+    return t >= s or t < e
 
 
 def pace_summary(drunk, expected):
@@ -461,7 +571,7 @@ def build_status_lines(now=None, next_reminder_at=None):
     elif drunk >= TARGET_OZ:
         lines.append("Reminders paused: daily goal reached")
     else:
-        lines.append("Reminders pause outside 7 AM - 9 PM")
+        lines.append(f"Reminders pause outside {active_window_label()}")
     return lines
 
 
@@ -526,11 +636,16 @@ def is_wayland_session():
 
 
 try:
-    from PyQt5.QtCore import QRect, Qt, QTimer
+    from PyQt5.QtCore import QEvent, QRect, Qt, QTimer
     from PyQt5.QtGui import QBrush, QColor, QFont, QIcon, QPainter, QPen, QPixmap
     from PyQt5.QtWidgets import (
         QAction,
         QApplication,
+        QCheckBox,
+        QComboBox,
+        QDialog,
+        QDialogButtonBox,
+        QFormLayout,
         QFrame,
         QHBoxLayout,
         QLabel,
@@ -539,6 +654,7 @@ try:
         QProgressBar,
         QPushButton,
         QLineEdit,
+        QSpinBox,
         QStyle,
         QSystemTrayIcon,
         QVBoxLayout,
@@ -642,17 +758,17 @@ if HAS_QT:
             chart_w = w - left_m - right_m
             chart_h = h - top_m - bottom_m
 
-            hours = list(range(DAY_START_HOUR, DAY_END_HOUR))
-            total_hours = DAY_END_HOUR - DAY_START_HOUR
+            hours = active_hours_list()
+            total_hours = len(hours)
             current_hour = self.snapshot.hour
             drunk = sum(self.hourly.values())
 
-            hist_exp = hourly_expected_weighted()
+            hist_exp = hourly_expected_steady()
             committed = load_committed_targets(self.snapshot)
 
             past_exp = {
                 h: committed.get(h, hist_exp.get(h, 0))
-                for h in range(DAY_START_HOUR, min(current_hour, DAY_END_HOUR))
+                for h in (hours[:hours.index(current_hour)] if current_hour in hours else hours)
             }
             current_future_exp, current_future_labels = adjusted_current_future_targets(self.snapshot)
 
@@ -692,7 +808,13 @@ if HAS_QT:
                 slot_x = left_m + i * slot_w
                 bar_x = slot_x + (slot_w - bar_w) / 2
                 is_future = hour > current_hour
-                is_current = hour == current_hour
+                if current_hour in hours:
+                    idx_cur = hours.index(current_hour)
+                    idx_h = hours.index(hour) if hour in hours else -1
+                    is_future = idx_h > idx_cur
+                    is_current = idx_h == idx_cur
+                else:
+                    is_current = False
 
                 exp_oz = combined_exp.get(hour, 0)
                 if is_future:
@@ -760,8 +882,9 @@ if HAS_QT:
                 try:
                     parts = time_str.split(":")
                     frac_hour = int(parts[0]) + int(parts[1]) / 60
-                    if DAY_START_HOUR <= frac_hour < DAY_END_HOUR:
-                        x_px = left_m + (frac_hour - DAY_START_HOUR) / total_hours * chart_w
+                    if within_active_hours(self.snapshot.replace(hour=int(frac_hour), minute=int((frac_hour % 1) * 60))):
+                        slot_idx = hours.index(int(frac_hour)) if int(frac_hour) in hours else 0
+                        x_px = left_m + (slot_idx + frac_hour % 1) / total_hours * chart_w
                         y_px = base_y - max(3, int(chart_h * min(oz, max_oz) / max_oz))
                         pts.append((int(x_px), y_px, oz))
                 except (ValueError, IndexError):
@@ -799,12 +922,23 @@ if HAS_QT:
             painter.end()
 
     class WaterPopup(QWidget):
-        def __init__(self, remind_mode=False, on_log=None, on_snooze=None, next_reminder_at=None):
+        def __init__(
+            self,
+            remind_mode=False,
+            on_log=None,
+            on_snooze=None,
+            on_skip=None,
+            on_configure=None,
+            next_reminder_at=None,
+        ):
             super().__init__()
             self.remind_mode = remind_mode
             self.on_log = on_log
             self.on_snooze = on_snooze
+            self.on_skip = on_skip
+            self.on_configure = on_configure
             self.next_reminder_at = next_reminder_at
+            self.input_guard_active = False
             self._build_ui()
             self._position_window()
 
@@ -833,8 +967,19 @@ if HAS_QT:
             clock_label = QLabel(snapshot_time.strftime("%-I:%M %p"))
             clock_label.setObjectName("status")
             clock_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            gear_button = QPushButton()
+            _gear_icon = QIcon.fromTheme("configure", QIcon.fromTheme("preferences-system"))
+            if not _gear_icon.isNull():
+                gear_button.setIcon(_gear_icon)
+            else:
+                gear_button.setText("…")
+            gear_button.setObjectName("dismiss_btn")
+            gear_button.setFixedSize(28, 28)
+            gear_button.setToolTip("Settings")
+            gear_button.clicked.connect(self._open_configure)
             title_row.addWidget(title)
             title_row.addWidget(clock_label)
+            title_row.addWidget(gear_button)
             root.addLayout(title_row)
 
             percent = min(100, int(drunk * 100 / TARGET_OZ))
@@ -870,8 +1015,10 @@ if HAS_QT:
             self.remaining_label = remaining_label
             root.addWidget(remaining_label)
 
-            if snapshot_time.hour >= 20:
-                evening_label = QLabel("Evening mode - small sips to protect sleep")
+            hours = active_hours_list()
+            near_end = hours[-2:] if len(hours) >= 2 else hours
+            if snapshot_time.hour in near_end:
+                evening_label = QLabel("Near end of active window - small sips to protect sleep")
                 evening_label.setObjectName("evening")
                 root.addWidget(evening_label)
 
@@ -886,7 +1033,7 @@ if HAS_QT:
                 next_label = QLabel("   Reminders paused: goal reached")
                 sip = 0
             else:
-                next_label = QLabel("   Reminders pause outside 7 AM - 9 PM")
+                next_label = QLabel(f"   Reminders pause outside {active_window_label()}")
                 sip = 0
             next_label.setObjectName("status")
             self.next_label = next_label
@@ -982,16 +1129,67 @@ if HAS_QT:
                     snooze_row.addWidget(snooze_button)
                 root.addLayout(snooze_row)
 
+            action_row = QHBoxLayout()
+            action_row.setSpacing(6)
+
+            if self.remind_mode:
+                skip_button = QPushButton("Skip this drink")
+                skip_button.setObjectName("dismiss_btn")
+                skip_button.clicked.connect(self._skip_and_close)
+                action_row.addWidget(skip_button)
+
+            action_row.addStretch(1)
+
             dismiss = QPushButton("Dismiss")
             dismiss.setObjectName("dismiss_btn")
             dismiss.clicked.connect(self.close)
-            root.addWidget(dismiss, alignment=Qt.AlignRight)
+            action_row.addWidget(dismiss)
+            root.addLayout(action_row)
 
             self.adjustSize()
 
         def showEvent(self, event):
             super().showEvent(event)
+            if self.remind_mode:
+                self._arm_input_guard()
             self._refresh_dynamic_display()
+
+        def closeEvent(self, event):
+            self._disarm_input_guard()
+            super().closeEvent(event)
+
+        def eventFilter(self, obj, event):
+            if self.input_guard_active and self._is_guarded_input_event(event):
+                if obj is self or self.isAncestorOf(obj):
+                    return True
+            return super().eventFilter(obj, event)
+
+        def _arm_input_guard(self):
+            if self.input_guard_active:
+                return
+            app = QApplication.instance()
+            if app is None:
+                return
+            self.input_guard_active = True
+            app.installEventFilter(self)
+            QTimer.singleShot(REMINDER_INPUT_GUARD_MS, self._disarm_input_guard)
+            logging.info("Guarding reminder popup keyboard input for %s ms", REMINDER_INPUT_GUARD_MS)
+
+        def _disarm_input_guard(self):
+            if not self.input_guard_active:
+                return
+            app = QApplication.instance()
+            if app is not None:
+                app.removeEventFilter(self)
+            self.input_guard_active = False
+
+        def _is_guarded_input_event(self, event):
+            return event.type() in {
+                QEvent.KeyPress,
+                QEvent.KeyRelease,
+                QEvent.ShortcutOverride,
+                QEvent.InputMethod,
+            }
 
         def _refresh_dynamic_display(self):
             now = datetime.now()
@@ -1038,7 +1236,7 @@ if HAS_QT:
                 self.next_label.setText("   Reminders paused: goal reached")
                 sip = 0
             else:
-                self.next_label.setText("   Reminders pause outside 7 AM - 9 PM")
+                self.next_label.setText(f"   Reminders pause outside {active_window_label()}")
                 sip = 0
 
             self._update_button_highlight(sip)
@@ -1099,6 +1297,174 @@ if HAS_QT:
                 self.on_snooze(minutes)
             self.close()
 
+        def _skip_and_close(self):
+            logging.info("Skipped current reminder drink")
+            if callable(self.on_skip):
+                self.on_skip()
+            self.close()
+
+        def _open_configure(self):
+            if callable(self.on_configure):
+                self.on_configure()
+
+
+    class ConfigDialog(QDialog):
+        _COMBO_STYLE = (
+            "QComboBox { background: #161b22; color: #c9d1d9; border: 1px solid #30363d;"
+            "            border-radius: 6px; padding: 3px 6px;"
+            "            font-family: 'JetBrains Mono','Noto Mono',monospace; font-size: 12px; }"
+            "QComboBox::drop-down { border: none; width: 18px; }"
+            "QComboBox QAbstractItemView { background: #161b22; color: #c9d1d9;"
+            "                              selection-background-color: #1f6feb; border: 1px solid #30363d; }"
+        )
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setWindowTitle("Water Tracker — Settings")
+            self.setStyleSheet(
+                "QDialog { background: #0d1117; color: #c9d1d9; }"
+                "QLabel { color: #c9d1d9; font-family: 'JetBrains Mono','Noto Mono',monospace; font-size: 12px; }"
+                "QSpinBox { background: #161b22; color: #c9d1d9; border: 1px solid #30363d;"
+                "           border-radius: 6px; padding: 4px 8px;"
+                "           font-family: 'JetBrains Mono','Noto Mono',monospace; }"
+                "QCheckBox { color: #c9d1d9; font-family: 'JetBrains Mono','Noto Mono',monospace; font-size: 12px; }"
+                "QPushButton { background: #161b22; color: #58a6ff; border: 1px solid #30363d;"
+                "              border-radius: 6px; padding: 5px 14px; }"
+                "QPushButton:hover { background: #1f6feb; color: #ffffff; }"
+                + self._COMBO_STYLE
+            )
+
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(18, 16, 18, 16)
+            layout.setSpacing(10)
+
+            form = QFormLayout()
+            form.setSpacing(8)
+
+            self.target_spin = QSpinBox()
+            self.target_spin.setRange(1, 500)
+            self.target_spin.setValue(TARGET_OZ)
+            self.target_spin.setSuffix(" oz")
+            form.addRow("Daily target:", self.target_spin)
+
+            self.use_24h = QCheckBox("24-hour clock (0–23)")
+            self.use_24h.setChecked(USE_24H)
+            form.addRow("", self.use_24h)
+
+            self.start_h, self.start_m, self.start_ampm, start_widget = self._make_time_row(
+                DAY_START_HOUR, DAY_START_MINUTE
+            )
+            form.addRow("Day start:", start_widget)
+
+            self.end_h, self.end_m, self.end_ampm, end_widget = self._make_time_row(
+                DAY_END_HOUR, DAY_END_MINUTE
+            )
+            form.addRow("Day end:", end_widget)
+
+            hint = QLabel("Tip: set end ≤ start for overnight schedules (e.g. start 9 PM, end 8 AM).")
+            hint.setObjectName("status")
+            hint.setWordWrap(True)
+            form.addRow("", hint)
+
+            layout.addLayout(form)
+
+            buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            buttons.accepted.connect(self._accept)
+            buttons.rejected.connect(self.reject)
+            layout.addWidget(buttons)
+
+            self.use_24h.toggled.connect(self._on_toggle_24h)
+            self._on_toggle_24h(USE_24H)
+
+        @staticmethod
+        def _hour_items_12():
+            return [str(h) for h in range(1, 13)]
+
+        @staticmethod
+        def _hour_items_24():
+            return [f"{h:02d}" for h in range(24)]
+
+        @staticmethod
+        def _minute_items():
+            return [f"{m:02d}" for m in range(0, 60, 5)]
+
+        @staticmethod
+        def _hour_to_12h(h24):
+            return h24 % 12 or 12, "AM" if h24 < 12 else "PM"
+
+        @staticmethod
+        def _hour_from_12h(h12_str, period):
+            h = int(h12_str) % 12
+            return h + (12 if period == "PM" else 0)
+
+        def _make_time_row(self, hour_24, minute):
+            h_combo = QComboBox()
+            h_combo.addItems(self._hour_items_12())
+            h12, period = self._hour_to_12h(hour_24)
+            h_combo.setCurrentText(str(h12))
+
+            sep = QLabel(":")
+            sep.setObjectName("status")
+
+            m_combo = QComboBox()
+            m_combo.addItems(self._minute_items())
+            snapped = (minute // 5) * 5
+            m_combo.setCurrentText(f"{snapped:02d}")
+
+            ampm_combo = QComboBox()
+            ampm_combo.addItems(["AM", "PM"])
+            ampm_combo.setCurrentText(period)
+
+            container = QWidget()
+            row = QHBoxLayout(container)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(4)
+            row.addWidget(h_combo)
+            row.addWidget(sep)
+            row.addWidget(m_combo)
+            row.addWidget(ampm_combo)
+            row.addStretch()
+
+            return h_combo, m_combo, ampm_combo, container
+
+        def _on_toggle_24h(self, checked):
+            for h_combo, ampm_combo in [
+                (self.start_h, self.start_ampm),
+                (self.end_h, self.end_ampm),
+            ]:
+                cur = h_combo.currentText()
+                if checked:
+                    h24 = self._hour_from_12h(cur, ampm_combo.currentText())
+                    h_combo.clear()
+                    h_combo.addItems(self._hour_items_24())
+                    h_combo.setCurrentText(f"{h24:02d}")
+                    ampm_combo.setVisible(False)
+                else:
+                    h24 = int(cur)
+                    h12, period = self._hour_to_12h(h24)
+                    h_combo.clear()
+                    h_combo.addItems(self._hour_items_12())
+                    h_combo.setCurrentText(str(h12))
+                    ampm_combo.setCurrentText(period)
+                    ampm_combo.setVisible(True)
+
+        def _read_time(self, h_combo, m_combo, ampm_combo):
+            if self.use_24h.isChecked():
+                return int(h_combo.currentText()), int(m_combo.currentText())
+            return self._hour_from_12h(h_combo.currentText(), ampm_combo.currentText()), int(m_combo.currentText())
+
+        def _accept(self):
+            sh, sm = self._read_time(self.start_h, self.start_m, self.start_ampm)
+            eh, em = self._read_time(self.end_h, self.end_m, self.end_ampm)
+            if sh == eh and sm == em:
+                QMessageBox.warning(self, "Invalid range", "Start and end times must differ.")
+                return
+            self.accept()
+
+        def values(self):
+            sh, sm = self._read_time(self.start_h, self.start_m, self.start_ampm)
+            eh, em = self._read_time(self.end_h, self.end_m, self.end_ampm)
+            return self.target_spin.value(), sh, sm, eh, em, self.use_24h.isChecked()
 
     class WaterTray:
         def __init__(self, app):
@@ -1229,6 +1595,12 @@ if HAS_QT:
             error_log_action.triggered.connect(self.show_error_log)
             self.menu.addAction(error_log_action)
 
+            self.menu.addSeparator()
+
+            configure_action = QAction("Configure...", self.menu)
+            configure_action.triggered.connect(self.show_config)
+            self.menu.addAction(configure_action)
+
             quit_action = QAction("Quit tray", self.menu)
             quit_action.triggered.connect(self.app.quit)
             self.menu.addAction(quit_action)
@@ -1279,7 +1651,9 @@ if HAS_QT:
             last_time = last_entry_time(moment)
             if last_time is not None:
                 candidate = last_time + timedelta(minutes=interval)
-                self.next_reminder_at = max(moment, candidate)
+                if candidate <= moment:
+                    candidate = moment + timedelta(minutes=interval)
+                self.next_reminder_at = candidate
             else:
                 self.next_reminder_at = moment + timedelta(minutes=interval)
             logging.info(
@@ -1295,7 +1669,7 @@ if HAS_QT:
             if drunk >= TARGET_OZ:
                 return "Reminders paused: goal reached"
             if not within_active_hours(now):
-                return "Reminders pause outside 7 AM - 9 PM"
+                return f"Reminders pause outside {active_window_label()}"
             if not self.next_reminder_at:
                 minutes = fallback_next_reminder_minutes(now)
                 return f"Next reminder: ~{minutes} min"
@@ -1340,7 +1714,13 @@ if HAS_QT:
             self.popups = [item for item in self.popups if item.isVisible()]
 
         def show_manual_popup(self):
-            popup = WaterPopup(remind_mode=False, on_log=self._after_log, next_reminder_at=self.next_reminder_at)
+            popup = WaterPopup(
+                remind_mode=False,
+                on_log=self._after_log,
+                on_skip=self.skip_current_drink,
+                on_configure=self.show_config,
+                next_reminder_at=self.next_reminder_at,
+            )
             popup.show()
             popup.raise_()
             if not is_wayland_session():
@@ -1353,6 +1733,8 @@ if HAS_QT:
                 remind_mode=True,
                 on_log=self._after_log,
                 on_snooze=self.snooze_reminder,
+                on_skip=self.skip_current_drink,
+                on_configure=self.show_config,
                 next_reminder_at=self.next_reminder_at,
             )
             popup.show()
@@ -1361,12 +1743,6 @@ if HAS_QT:
                 popup.activateWindow()
             logging.info("Displayed reminder popup")
             self._remember_popup(popup)
-            self.tray.showMessage(
-                "Water reminder",
-                "Time for another drink. Use the popup or the tray menu to log it.",
-                QSystemTrayIcon.Information,
-                5000,
-            )
 
         def add_amount(self, oz):
             log_oz(oz)
@@ -1379,6 +1755,22 @@ if HAS_QT:
             self.tray.showMessage(
                 "Water reminder snoozed",
                 f"Next reminder in about {minutes} minutes.",
+                QSystemTrayIcon.Information,
+                2500,
+            )
+
+        def skip_current_drink(self):
+            now = datetime.now()
+            self.schedule_next_reminder(now)
+            if self.next_reminder_at is None:
+                message = "No more reminders scheduled for today."
+            else:
+                minutes = max(1, math.ceil((self.next_reminder_at - now).total_seconds() / 60))
+                message = f"Next reminder in about {minutes} minutes."
+            self.refresh_state(reschedule=False)
+            self.tray.showMessage(
+                "Water reminder skipped",
+                message,
                 QSystemTrayIcon.Information,
                 2500,
             )
@@ -1420,6 +1812,18 @@ if HAS_QT:
 
             QMessageBox.information(None, "Water app log", text)
 
+        def show_config(self):
+            dialog = ConfigDialog()
+            if dialog.exec_() == QDialog.Accepted:
+                target_oz, sh, sm, eh, em, use_24h = dialog.values()
+                save_config(target_oz, sh, sm, eh, em, use_24h)
+                _apply_config()
+                logging.info(
+                    "Settings updated: target=%s oz  start=%02d:%02d  end=%02d:%02d",
+                    target_oz, sh, sm, eh, em,
+                )
+                self.refresh_state(reschedule=True)
+
 
 def run_qt_popup(remind_mode=False):
     setup_logging()
@@ -1428,7 +1832,10 @@ def run_qt_popup(remind_mode=False):
     signal_timer = QTimer()
     signal_timer.start(250)
     signal_timer.timeout.connect(lambda: None)
-    popup = WaterPopup(remind_mode=remind_mode)
+    popup = WaterPopup(
+        remind_mode=remind_mode,
+        on_skip=(lambda: None) if remind_mode else None,
+    )
     popup.show()
     popup.raise_()
     if not is_wayland_session():
@@ -1498,6 +1905,7 @@ def run_kdialog():
         "16 oz (glass)": 16,
         "20 oz (large)": 20,
         "24 oz (bottle)": 24,
+        "Skip this drink": "skip-drink",
         "Nothing / dismiss": None,
     }
 
@@ -1513,6 +1921,8 @@ def run_kdialog():
     selected_index = int(result.stdout.strip())
     selected_label = buttons[selected_index]
     ounces = button_map[selected_label]
+    if ounces == "skip-drink":
+        return
     if ounces:
         log_oz(ounces)
 
