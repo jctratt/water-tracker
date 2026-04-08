@@ -10,7 +10,7 @@
 			"/usr/lib/python3/dist-packages"
 		],
 		"chat.tools.terminal.autoApprove": {
-			"/home/neon/bin/water": true
+			"./water": true
 		}
 	}
 }
