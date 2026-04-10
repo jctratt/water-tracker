@@ -1535,6 +1535,7 @@ if HAS_QT:
             self.end_h, self.end_m, self.end_ampm, end_widget = self._make_time_row(
                 DAY_END_HOUR, DAY_END_MINUTE
             )
+            self._time_rows_in_24h = False
             form.addRow("Day end:", end_widget)
 
             hint = QLabel("Tip: set end ≤ start for overnight schedules (e.g. start 9 PM, end 8 AM).")
@@ -1643,7 +1644,8 @@ if HAS_QT:
             layout.addWidget(buttons)
 
             self.use_24h.toggled.connect(self._on_toggle_24h)
-            self._on_toggle_24h(USE_24H)
+            if USE_24H:
+                self._on_toggle_24h(True)
 
         @staticmethod
         def _hour_items_12():
@@ -1697,6 +1699,8 @@ if HAS_QT:
             return h_combo, m_combo, ampm_combo, container
 
         def _on_toggle_24h(self, checked):
+            if checked == self._time_rows_in_24h:
+                return
             for h_combo, ampm_combo in [
                 (self.start_h, self.start_ampm),
                 (self.end_h, self.end_ampm),
@@ -1716,6 +1720,7 @@ if HAS_QT:
                     h_combo.setCurrentText(str(h12))
                     ampm_combo.setCurrentText(period)
                     ampm_combo.setVisible(True)
+                    self._time_rows_in_24h = checked
 
         def _read_time(self, h_combo, m_combo, ampm_combo):
             if self.use_24h.isChecked():
